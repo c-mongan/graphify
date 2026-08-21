@@ -302,6 +302,7 @@ session = await client.create_session(
     enable_host_git_operations=False,
     skip_custom_instructions=True,
     memory={"enabled": False},
+    config_directory=<temporary-empty-directory>,
     embedding_cache_storage="in-memory",
     mcp_oauth_token_storage="in-memory",
     on_permission_request=<deny every request>,
@@ -318,7 +319,11 @@ The model receives text and inline image bytes only. It cannot read the corpus,
 shell, Git state, MCP data, local instructions, memories, or arbitrary host files.
 ```
 
-Set the runtime working directory to a temporary empty directory. Clean it up in all success and failure paths.
+Set both the runtime working directory and session configuration directory to a
+temporary empty directory. The configuration-directory override prevents the
+runtime from loading user-level MCP configuration when SDK 1.x omits an empty
+`mcp_servers={}` value from the wire request. Clean the directory up in all
+success and failure paths.
 
 ### System and user prompts
 
@@ -340,17 +345,24 @@ Do not rely on conversational prose parsing.
 
 ### Output
 
-Use:
+Register the event handler before sending, allow the newly created runtime a
+short bounded settle period, call `send(...)`, and poll the SDK's documented
+session history until the final `assistant.message` appears. Do not depend only
+on `send_and_wait()`: affected SDK/runtime versions can lose or indefinitely
+delay the terminal `session.idle` event.
 
-```python
-send_and_wait(..., timeout=<GRAPHIFY_API_TIMEOUT>)
-```
-
-Consume its final `assistant.message` event.
+If neither the callback nor session history shows `user.message`, model-call,
+or assistant activity within the initialization window, fail the request and
+clean up the session. Do not resend at this adapter layer: when event delivery
+itself is unreliable, absence of a local event cannot prove that the remote
+model call did not start. Graphify's existing timeout and adaptive-retry path
+remains authoritative.
 
 Required behavior:
 
 * Fail clearly if no final assistant message is returned.
+* Bound session-start detection separately from model execution.
+* Never retry a possibly accepted model call inside the adapter.
 * Feed final content into Graphify’s existing JSON parser.
 * Preserve existing hollow-response detection and adaptive retry.
 * Do not depend on an undocumented native JSON-schema response format; use Graphify’s existing JSON parser and validation path.

@@ -139,12 +139,20 @@ def test_friendly_error_categories():
 
 def _install_fake_copilot(monkeypatch, captured, *, response=None, fail=None):
     class FakeSession:
-        async def send_and_wait(self, prompt, **kwargs):
+        async def send(self, prompt, **kwargs):
             captured["prompt"] = prompt
             captured["send"] = kwargs
             if fail is not None:
                 raise fail
-            return response
+            handler = captured["session"]["on_event"]
+            if response is None:
+                handler(SimpleNamespace(type="session.idle", data=None))
+            else:
+                handler(response)
+            return "message-1"
+
+        async def get_events(self):
+            return []
 
         async def disconnect(self):
             captured["disconnected"] = True
@@ -158,6 +166,7 @@ def _install_fake_copilot(monkeypatch, captured, *, response=None, fail=None):
 
         async def create_session(self, **kwargs):
             captured["session"] = kwargs
+            kwargs["on_event"](SimpleNamespace(type="session.tools_updated", data=None))
             return FakeSession()
 
         async def stop(self):
@@ -192,13 +201,6 @@ def test_call_uses_locked_down_session_and_cleans_temp_workspace(monkeypatch):
     )
     _install_fake_copilot(monkeypatch, captured, response=response)
 
-    # The fake runtime delivers usage before the final message.
-    original_create = captured
-    # Install a client variant that emits events through the callback.
-    fake_module = sys.modules["copilot"]
-    fake_client_type = fake_module.CopilotClient
-    original_session = fake_client_type
-
     result = backend.call_copilot_sdk(
         "UNTRUSTED_SOURCE", system_prompt="GRAPHIFY_SYSTEM", model=None,
         reasoning_effort="low", context_tier="default", timeout_seconds=3,
@@ -213,6 +215,7 @@ def test_call_uses_locked_down_session_and_cleans_temp_workspace(monkeypatch):
     assert session["tools"] == []
     assert session["available_tools"] == []
     assert session["mcp_servers"] == {}
+    assert session["config_directory"] == session["working_directory"]
     for key in (
         "enable_session_telemetry", "enable_file_change_tracking", "enable_session_store",
         "enable_skills", "enable_config_discovery", "enable_on_demand_instruction_discovery",
@@ -232,7 +235,7 @@ def test_usage_events_aggregate(monkeypatch):
     captured = {}
 
     class FakeSession:
-        async def send_and_wait(self, prompt, **kwargs):
+        async def send(self, prompt, **kwargs):
             handler = captured["session"]["on_event"]
             handler(_usage_event())
             handler(SimpleNamespace(
@@ -247,7 +250,16 @@ def test_usage_events_aggregate(monkeypatch):
                 type="session.usage_info",
                 data=SimpleNamespace(current_tokens=55, token_limit=100),
             ))
-            return SimpleNamespace(type="assistant.message", data=SimpleNamespace(content=_GRAPH_JSON))
+            handler(
+                SimpleNamespace(
+                    type="assistant.message",
+                    data=SimpleNamespace(content=_GRAPH_JSON),
+                )
+            )
+            return "message-1"
+
+        async def get_events(self):
+            return []
 
         async def disconnect(self):
             pass
@@ -259,6 +271,7 @@ def test_usage_events_aggregate(monkeypatch):
             pass
         async def create_session(self, **kwargs):
             captured["session"] = kwargs
+            kwargs["on_event"](SimpleNamespace(type="session.tools_updated", data=None))
             return FakeSession()
         async def stop(self):
             pass
@@ -338,6 +351,120 @@ def test_adapter_works_inside_running_event_loop(monkeypatch):
     assert result["content"] == _GRAPH_JSON
 
 
+def test_unstarted_session_fails_without_resending(monkeypatch):
+    monkeypatch.setattr(backend, "_SESSION_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(backend, "_SESSION_START_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(backend, "_SESSION_POLL_SECONDS", 0.001)
+    captured = {"clients": 0, "sends": 0, "disconnects": 0, "stops": 0}
+
+    class FakeSession:
+        async def send(self, _prompt, **_kwargs):
+            captured["sends"] += 1
+            return "message-1"
+
+        async def get_events(self):
+            return []
+
+        async def disconnect(self):
+            captured["disconnects"] += 1
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            captured["clients"] += 1
+
+        async def start(self):
+            pass
+
+        async def create_session(self, **_kwargs):
+            return FakeSession()
+
+        async def stop(self):
+            captured["stops"] += 1
+
+    module = types.ModuleType("copilot")
+    setattr(module, "CopilotClient", FakeClient)
+    monkeypatch.setitem(sys.modules, "copilot", module)
+
+    with pytest.raises(RuntimeError, match="did not start processing it"):
+        backend.call_copilot_sdk(
+            "source",
+            system_prompt="system",
+            model=None,
+            reasoning_effort=None,
+            context_tier=None,
+            timeout_seconds=2,
+        )
+
+    assert captured == {
+        "clients": 1,
+        "sends": 1,
+        "disconnects": 1,
+        "stops": 1,
+    }
+
+
+def test_history_fallback_ignores_child_agent_messages():
+    child = SimpleNamespace(
+        agent_id="child",
+        type="assistant.message",
+        data=SimpleNamespace(content="child output"),
+    )
+    assert backend._history_state([child]) == (False, False, False, None)
+
+    root = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON),
+    )
+    assert backend._history_state([child, root]) == (True, False, True, root)
+
+
+def test_history_polling_recovers_final_message_without_callback(monkeypatch):
+    monkeypatch.setattr(backend, "_SESSION_SETTLE_SECONDS", 0)
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON),
+    )
+
+    class FakeSession:
+        async def send(self, _prompt, **_kwargs):
+            return "message-1"
+
+        async def get_events(self):
+            return [_usage_event(), response]
+
+        async def disconnect(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def create_session(self, **_kwargs):
+            return FakeSession()
+
+        async def stop(self):
+            pass
+
+    module = types.ModuleType("copilot")
+    setattr(module, "CopilotClient", FakeClient)
+    monkeypatch.setitem(sys.modules, "copilot", module)
+
+    result = backend.call_copilot_sdk(
+        "source",
+        system_prompt="system",
+        model=None,
+        reasoning_effort=None,
+        context_tier=None,
+        timeout_seconds=2,
+    )
+    assert result["content"] == _GRAPH_JSON
+    assert result["input_tokens"] == 12
+    assert result["output_tokens"] == 7
+
+
 def test_sdk_error_does_not_echo_corpus_and_still_cleans_up(monkeypatch):
     captured = {}
     _install_fake_copilot(
@@ -382,10 +509,22 @@ def test_cleanup_failure_does_not_mask_primary_error(monkeypatch, primary_failur
     captured = {}
 
     class FakeSession:
-        async def send_and_wait(self, _prompt, **_kwargs):
+        def __init__(self, handler):
+            self.handler = handler
+
+        async def send(self, _prompt, **_kwargs):
             if primary_failure:
                 raise RuntimeError("primary extraction failure")
-            return SimpleNamespace(type="assistant.message", data=SimpleNamespace(content=_GRAPH_JSON))
+            self.handler(
+                SimpleNamespace(
+                    type="assistant.message",
+                    data=SimpleNamespace(content=_GRAPH_JSON),
+                )
+            )
+            return "message-1"
+
+        async def get_events(self):
+            return []
 
         async def disconnect(self):
             raise RuntimeError("cleanup failure")
@@ -397,8 +536,9 @@ def test_cleanup_failure_does_not_mask_primary_error(monkeypatch, primary_failur
         async def start(self):
             pass
 
-        async def create_session(self, **_kwargs):
-            return FakeSession()
+        async def create_session(self, **kwargs):
+            kwargs["on_event"](SimpleNamespace(type="session.tools_updated", data=None))
+            return FakeSession(kwargs["on_event"])
 
         async def stop(self):
             captured["stopped"] = True
@@ -414,7 +554,7 @@ def test_cleanup_failure_does_not_mask_primary_error(monkeypatch, primary_failur
             )
         assert "cleanup failure" not in str(exc_info.value)
     else:
-        with pytest.raises(RuntimeError, match="cleanup failure"):
+        with pytest.raises(RuntimeError, match="cleanup failed"):
             backend.call_copilot_sdk(
                 "source", system_prompt="system", model=None, reasoning_effort=None,
                 context_tier=None, timeout_seconds=2,
