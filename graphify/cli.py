@@ -2887,7 +2887,7 @@ def dispatch_command(cmd: str) -> None:
         # has an API key set.
         if len(sys.argv) < 3:
             print(
-                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
+                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama|bedrock|claude-cli|copilot-sdk] "
                 "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
                 "[--no-gitignore] [--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
@@ -3380,6 +3380,10 @@ def dispatch_command(cmd: str) -> None:
                             file=sys.stderr,
                         )
                         sys.exit(1)
+                elif backend == "copilot-sdk":
+                    # The official SDK reuses the user's Copilot login; no
+                    # Graphify-specific provider key is required.
+                    allow_no_key = True
                 if not allow_no_key:
                     print(
                         f"error: backend '{backend}' requires {_format_backend_env_keys(backend)} to be set.",
@@ -3651,6 +3655,17 @@ def dispatch_command(cmd: str) -> None:
                 sem_result["hyperedges"].extend(fresh.get("hyperedges", []))
                 sem_result["input_tokens"] += fresh.get("input_tokens", 0)
                 sem_result["output_tokens"] += fresh.get("output_tokens", 0)
+                for _usage_key in (
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                    "copilot_usage_cost",
+                ):
+                    if fresh.get(_usage_key):
+                        sem_result[_usage_key] = sem_result.get(_usage_key, 0) + fresh[_usage_key]
+                for _latest_key in ("context_current_tokens", "context_limit", "model"):
+                    if fresh.get(_latest_key) not in (None, ""):
+                        sem_result[_latest_key] = fresh[_latest_key]
 
         # Prune orphaned semantic cache entries. The semantic cache is
         # content-hash-keyed and unversioned, so it is never swept by the AST
@@ -3721,6 +3736,17 @@ def dispatch_command(cmd: str) -> None:
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
         }
+        for _usage_key in (
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "copilot_usage_cost",
+        ):
+            if sem_result.get(_usage_key):
+                merged[_usage_key] = sem_result[_usage_key]
+        for _latest_key in ("context_current_tokens", "context_limit", "model"):
+            if sem_result.get(_latest_key) not in (None, ""):
+                merged[_latest_key] = sem_result[_latest_key]
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
@@ -3926,6 +3952,11 @@ def dispatch_command(cmd: str) -> None:
                     f"{merged['output_tokens']:,} out, "
                     f"est. cost: ${cost:.4f}"
                 )
+            if backend == "copilot-sdk" and merged.get("copilot_usage_cost"):
+                print(
+                    "[graphify extract] Copilot usage signal: "
+                    f"{merged['copilot_usage_cost']} (not a USD API estimate)"
+                )
             try:
                 if has_path:
                     _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None)
@@ -4120,6 +4151,11 @@ def dispatch_command(cmd: str) -> None:
                 f"{merged['input_tokens']:,} in / "
                 f"{merged['output_tokens']:,} out, "
                 f"est. cost (~{backend}): ${cost:.4f}"
+            )
+        if backend == "copilot-sdk" and merged.get("copilot_usage_cost"):
+            print(
+                "[graphify extract] Copilot usage signal: "
+                f"{merged['copilot_usage_cost']} (not a USD API estimate)"
             )
         # extract intentionally stops at graph.json + analysis; the report and
         # community labels are produced by `cluster-only` (or an agent's Step 5).

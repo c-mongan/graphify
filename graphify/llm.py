@@ -216,6 +216,17 @@ BACKENDS: dict[str, dict] = {
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
     },
+    "copilot-sdk": {
+        # Uses the official GitHub Copilot SDK and the user's existing Copilot
+        # authentication.  This sentinel is never sent to the SDK; None lets
+        # the Copilot runtime/account policy choose its default model.
+        "default_model": "copilot-plan-default",
+        "model_env_key": "GRAPHIFY_COPILOT_MODEL",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": None,
+        "max_tokens": 16384,
+        "vision": True,
+    },
 }
 
 
@@ -1882,6 +1893,61 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192, *, deep
     return result
 
 
+def _call_copilot_sdk(
+    user_message: str,
+    *,
+    model: str | None = None,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+) -> dict:
+    """Call the optional Copilot SDK adapter and parse its raw response."""
+    try:
+        from graphify.copilot_sdk_backend import CopilotImage, call_copilot_sdk
+    except ImportError:
+        # The adapter owns the actionable optional-dependency message.  Keep
+        # this import lazy so Graphify core remains Python 3.10 compatible.
+        raise
+
+    inline_images = [
+        CopilotImage(data=ref.raw, mime_type=ref.media_type, display_name=ref.rel)
+        for ref in (images or [])
+        if ref.raw is not None
+    ]
+    payload = call_copilot_sdk(
+        user_message,
+        system_prompt=_extraction_system(deep=deep_mode),
+        model=model,
+        reasoning_effort=None,
+        context_tier=None,
+        timeout_seconds=_resolve_api_timeout(),
+        images=inline_images,
+    )
+    raw_content = payload.get("content") if isinstance(payload, dict) else None
+    if not isinstance(raw_content, str) or not raw_content.strip():
+        raise ValueError("Copilot SDK returned no final assistant message.")
+    result = _parse_llm_json(raw_content)
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+        "context_current_tokens",
+        "context_limit",
+        "model",
+        "finish_reason",
+    ):
+        if key in payload:
+            result[key] = payload[key]
+    result.setdefault("input_tokens", 0)
+    result.setdefault("output_tokens", 0)
+    result.setdefault("model", model or "copilot-plan-default")
+    result.setdefault("finish_reason", "stop")
+    _mark_hollow(result, raw_content, "copilot-sdk")
+    return result
+
+
 def extract_files_direct(
     files: list[Path],
     backend: str | None = None,
@@ -1931,7 +1997,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "copilot-sdk"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1955,6 +2021,16 @@ def extract_files_direct(
         result = _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "claude-cli":
         result = _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    elif backend == "copilot-sdk":
+        # Keep model=None meaningful: the SDK selects the account/runtime
+        # default.  The adapter applies GRAPHIFY_COPILOT_MODEL precedence.
+        copilot_message = _with_image_notes(user_msg, image_refs)
+        result = _call_copilot_sdk(
+            copilot_message,
+            model=model,
+            deep_mode=deep_mode,
+            images=image_refs,
+        )
     elif backend == "bedrock":
         result = _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "azure":
@@ -2128,6 +2204,12 @@ def _looks_like_context_exceeded(exc: BaseException) -> bool:
 
 def _looks_like_timeout(exc: BaseException) -> bool:
     """Classify an exception as a recognized subprocess or SDK timeout."""
+    try:
+        from graphify.copilot_sdk_backend import CopilotSdkTimeoutError
+        if isinstance(exc, CopilotSdkTimeoutError):
+            return True
+    except ImportError:
+        pass
     types: list[type[BaseException]] = [subprocess.TimeoutExpired]
     try:
         import openai
@@ -2276,7 +2358,8 @@ def _extract_with_adaptive_retry(
             "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
             "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
             "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
+            **_merged_provider_usage(left, right),
+            "model": model or left.get("model") or right.get("model"),
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
         }
@@ -2360,7 +2443,8 @@ def _extract_with_adaptive_retry(
             "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
             "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
             "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
+            **_merged_provider_usage(left, right),
+            "model": model or left.get("model") or right.get("model"),
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
         }
@@ -2449,7 +2533,8 @@ def _extract_with_adaptive_retry(
         "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
         "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
         "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-        "model": result.get("model"),
+        **_merged_provider_usage(left, right),
+        "model": result.get("model") or left.get("model") or right.get("model"),
         # Both halves either succeeded or have already surfaced their own
         # truncation warning; the merged result is no longer truncated as a
         # logical unit.
@@ -2567,6 +2652,10 @@ def extract_corpus_parallel(
     # claude-cli shells out to a Claude Code session; parallel subprocesses conflict
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    # The Copilot adapter starts one bundled stdio runtime per request.  Keep
+    # extraction serial unless the user explicitly opts into several runtimes.
+    if backend == "copilot-sdk" and os.environ.get("GRAPHIFY_COPILOT_SDK_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     def _checkpoint_chunk(result: dict, chunk: "list[Path | FileSlice]") -> None:
         # Persist each chunk's semantic results to the cache as soon as it
@@ -2768,6 +2857,17 @@ def _merge_into(merged: dict, result: dict) -> None:
     merged["hyperedges"].extend(result.get("hyperedges", []))
     merged["input_tokens"] += result.get("input_tokens", 0)
     merged["output_tokens"] += result.get("output_tokens", 0)
+    for key in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+    ):
+        if key in result:
+            merged[key] = merged.get(key, 0) + (result.get(key, 0) or 0)
+    for key in ("context_current_tokens", "context_limit", "model", "finish_reason"):
+        if result.get(key) not in (None, ""):
+            merged[key] = result[key]
     # Carry forward files a chunk truncated to an empty parse (#1950): these have
     # no items to ride the merge, so they'd otherwise be lost from the run-level
     # partial set the manifest stamp consults.
@@ -2776,6 +2876,26 @@ def _merge_into(merged: dict, result: dict) -> None:
         merged["_partial_files"] = sorted(
             set(merged.get("_partial_files", []) or []) | set(incoming)
         )
+
+
+def _merged_provider_usage(*results: dict) -> dict:
+    """Combine Copilot/provider metadata while preserving old result fields."""
+    out: dict = {}
+    for key in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+    ):
+        total = sum((r.get(key, 0) or 0) for r in results)
+        if total:
+            out[key] = total
+    for key in ("context_current_tokens", "context_limit", "model", "finish_reason"):
+        for result in reversed(results):
+            if result.get(key) not in (None, ""):
+                out[key] = result[key]
+                break
+    return out
 
 
 def _call_llm(
@@ -2810,7 +2930,7 @@ def _call_llm(
         ollama_url = _resolve_ollama_base_url(cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "copilot-sdk"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -2883,6 +3003,32 @@ def _call_llm(
                 cli_usage.get("output_tokens", 0),
             )
         return envelope.get("result", "")
+
+    if backend == "copilot-sdk":
+        from graphify.copilot_sdk_backend import call_copilot_sdk
+
+        response = call_copilot_sdk(
+            prompt,
+            system_prompt="",
+            model=model,
+            reasoning_effort=None,
+            context_tier=None,
+            timeout_seconds=_resolve_api_timeout(),
+        )
+        if usage_out is not None:
+            for source, target in (
+                ("input_tokens", "input"),
+                ("output_tokens", "output"),
+                ("cache_read_tokens", "cache_read_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
+                ("reasoning_tokens", "reasoning_tokens"),
+                ("copilot_usage_cost", "copilot_usage_cost"),
+            ):
+                usage_out[target] = usage_out.get(target, 0) + int(response.get(source, 0) or 0)
+            for key in ("context_current_tokens", "context_limit", "model", "finish_reason"):
+                if response.get(key) not in (None, ""):
+                    usage_out[key] = response[key]
+        return str(response.get("content") or "")
 
 
     if backend == "bedrock":
@@ -3082,7 +3228,7 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "copilot-sdk"):
             if _get_backend_api_key(name):
                 return name
     return None
@@ -3300,6 +3446,8 @@ def label_communities(
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    if backend == "copilot-sdk" and os.environ.get("GRAPHIFY_COPILOT_SDK_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 
     def _run_batch(batch_idx: int):
@@ -3329,6 +3477,17 @@ def label_communities(
         if usage_out is not None and batch_usage:
             usage_out["input"] = usage_out.get("input", 0) + batch_usage.get("input", 0)
             usage_out["output"] = usage_out.get("output", 0) + batch_usage.get("output", 0)
+            for key in (
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "copilot_usage_cost",
+            ):
+                if batch_usage.get(key):
+                    usage_out[key] = usage_out.get(key, 0) + batch_usage[key]
+            for key in ("context_current_tokens", "context_limit", "model", "finish_reason"):
+                if batch_usage.get(key) not in (None, ""):
+                    usage_out[key] = batch_usage[key]
         if exc is not None:
             errors[batch_idx] = exc
             start = batch_idx * batch_size
