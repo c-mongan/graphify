@@ -1,543 +1,422 @@
-"""Tests for the GitHub Copilot SDK backend and CLI fallback.
-
-The official SDK, runtime, executable, network, and enterprise credentials are
-all replaced with fakes. These tests therefore exercise Graphify's transport
-lifecycle and dispatch without transmitting data or requiring a Copilot seat.
-"""
+"""Mocked tests for the optional GitHub Copilot SDK backend."""
 from __future__ import annotations
 
-import json
+import asyncio
+import base64
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 
+from graphify import copilot_sdk_backend as backend
 from graphify import llm
 
-_RESPONSE = json.dumps(
-    {
-        "nodes": [
-            {
-                "id": "policy",
-                "label": "Policy",
-                "file_type": "document",
-                "source_file": "policy.md",
-            }
-        ],
-        "edges": [],
-        "hyperedges": [],
-    }
-)
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 
 
-@pytest.fixture(autouse=True)
-def reset_sdk_runtime():
-    llm._discard_copilot_sdk_runtime()
-    llm._COPILOT_SDK_FALLBACK_WARNED.clear()
-    yield
-    llm._discard_copilot_sdk_runtime()
-    llm._COPILOT_SDK_FALLBACK_WARNED.clear()
+_GRAPH_JSON = '{"nodes":[{"id":"alpha","label":"Alpha"}],"edges":[],"hyperedges":[]}'
 
 
-class _FakeBridge:
-    def __init__(self, text: str = _RESPONSE):
-        self.text = text
-        self.calls: list[dict] = []
-
-    def complete(self, prompt, *, model, attachments=None):
-        self.calls.append(
-            {"prompt": prompt, "model": model, "attachments": attachments}
-        )
-        return self.text
-
-
-def _ok_graph(nodes=None):
-    return {
-        "nodes": nodes or [],
-        "edges": [],
-        "hyperedges": [],
-        "input_tokens": 1,
-        "output_tokens": 1,
-        "model": "auto",
-        "finish_reason": "stop",
-    }
-
-
-def test_backend_registered_with_zero_cost_and_vision():
-    cfg = llm.BACKENDS["copilot-sdk"]
-    assert cfg["default_model"] == "auto"
-    assert cfg["vision"] is True
-    assert cfg["pricing"] == {"input": 0.0, "output": 0.0}
-    assert llm.estimate_cost("copilot-sdk", 1_000_000, 1_000_000) == 0.0
-
-
-def test_default_model_precedence(monkeypatch):
-    for name in (
-        "GRAPHIFY_COPILOT_SDK_MODEL",
-        "GRAPHIFY_COPILOT_MODEL",
-        "COPILOT_MODEL",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    assert llm._default_model_for_backend("copilot-sdk") == "auto"
-
-    monkeypatch.setenv("COPILOT_MODEL", "gpt-5-mini")
-    assert llm._default_model_for_backend("copilot-sdk") == "gpt-5-mini"
-
-    monkeypatch.setenv("GRAPHIFY_COPILOT_MODEL", "gpt-5.2")
-    assert llm._default_model_for_backend("copilot-sdk") == "gpt-5.2"
-
-    monkeypatch.setenv("GRAPHIFY_COPILOT_SDK_MODEL", "claude-sonnet-4.6")
-    assert llm._default_model_for_backend("copilot-sdk") == "claude-sonnet-4.6"
-
-
-def test_sdk_requires_python_311(monkeypatch):
-    monkeypatch.setattr(llm.sys, "version_info", (3, 10, 14))
-
-    with pytest.raises(llm._CopilotSdkUnavailable, match="Python 3.11"):
-        llm._load_copilot_sdk()
-
-
-def test_sdk_capability_check_fails_closed_for_legacy_client():
-    class LegacyClient:
-        def __init__(
-            self,
-            *,
-            connection=None,
-            working_directory=None,
-            use_logged_in_user=True,
-            enable_remote_sessions=False,
-        ):
-            pass
-
-    with pytest.raises(llm._CopilotSdkUnavailable, match="mode"):
-        llm._require_supported_kwargs(
-            LegacyClient,
-            {
-                "connection",
-                "working_directory",
-                "use_logged_in_user",
-                "enable_remote_sessions",
-                "mode",
-            },
-            api_name="CopilotClient",
-        )
-
-
-def test_sdk_extraction_parses_graph_and_estimates_usage(monkeypatch):
-    bridge = _FakeBridge()
-    monkeypatch.setattr(llm, "_get_copilot_sdk_runtime", lambda: bridge)
-
-    result = llm._call_copilot_sdk("source", model="auto")
-
-    assert result["nodes"][0]["id"] == "policy"
-    assert result["model"] == "auto"
-    assert result["finish_reason"] == "stop"
-    assert result["input_tokens"] > 0
-    assert result["output_tokens"] > 0
-    assert "graphify semantic extraction agent" in bridge.calls[0]["prompt"]
-    assert "output ONLY the JSON object" in bridge.calls[0]["prompt"]
-
-
-def test_sdk_images_are_file_attachments_not_loaded_as_base64(tmp_path, monkeypatch):
-    image = tmp_path / "diagram.png"
-    image.write_bytes(b"not-a-real-image-but-no-read-is-required")
-    bridge = _FakeBridge()
-    monkeypatch.setattr(llm, "_get_copilot_sdk_runtime", lambda: bridge)
-
-    result = llm.extract_files_direct(
-        [image],
-        backend="copilot-sdk",
-        root=tmp_path,
-    )
-
-    assert result["nodes"][0]["id"] == "policy"
-    call = bridge.calls[0]
-    assert call["attachments"] == [
-        {"type": "file", "path": str(image.resolve())}
+def test_copilot_extra_requires_session_lockdown_capabilities():
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
     ]
-    assert "source_file: diagram.png" in call["prompt"]
-    assert "not shown" not in call["prompt"]
+    expected = "github-copilot-sdk>=1.0.11,<2; python_version >= '3.11'"
+    assert extras["copilot"] == [expected]
+    assert expected in extras["all"]
 
 
-def test_sdk_transport_failure_falls_back_to_cli(monkeypatch, capsys):
-    def fail_sdk():
-        raise llm._CopilotSdkUnavailable("SDK package missing")
-
-    cli = MagicMock(return_value=_RESPONSE)
-    monkeypatch.setattr(llm, "_get_copilot_sdk_runtime", fail_sdk)
-    monkeypatch.setattr(llm, "_run_copilot_cli", cli)
-
-    result = llm._call_copilot_sdk("source", model="auto")
-
-    assert result["nodes"][0]["id"] == "policy"
-    cli.assert_called_once()
-    assert cli.call_args.kwargs["model"] == "auto"
-    assert "falling back to copilot-cli" in capsys.readouterr().err
+def test_resolve_settings_precedence_and_sentinel(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_COPILOT_MODEL", "env-model")
+    monkeypatch.setenv("GRAPHIFY_COPILOT_REASONING_EFFORT", "high")
+    monkeypatch.setenv("GRAPHIFY_COPILOT_CONTEXT_TIER", "long_context")
+    assert backend.resolve_settings() == ("env-model", "high", "long_context")
+    assert backend.resolve_settings(
+        model="cli-model", reasoning_effort="low", context_tier="default"
+    ) == ("cli-model", "low", "default")
+    monkeypatch.setenv("GRAPHIFY_COPILOT_MODEL", backend.COPILOT_DEFAULT_MODEL)
+    assert backend.resolve_settings()[0] is None
 
 
-def test_fallback_warning_is_emitted_once(monkeypatch, capsys):
-    monkeypatch.setattr(
-        llm,
-        "_get_copilot_sdk_runtime",
-        MagicMock(side_effect=llm._CopilotSdkUnavailable("not installed")),
-    )
-    monkeypatch.setattr(llm, "_run_copilot_cli", MagicMock(return_value="ok"))
-
-    assert llm._run_copilot_sdk("one", model="auto") == "ok"
-    assert llm._run_copilot_sdk("two", model="auto") == "ok"
-
-    assert capsys.readouterr().err.count("falling back to copilot-cli") == 1
-
-
-def test_fallback_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("GRAPHIFY_COPILOT_SDK_FALLBACK", "0")
-    monkeypatch.setattr(
-        llm,
-        "_get_copilot_sdk_runtime",
-        MagicMock(side_effect=llm._CopilotSdkUnavailable("not installed")),
-    )
-    cli = MagicMock()
-    monkeypatch.setattr(llm, "_run_copilot_cli", cli)
-
-    with pytest.raises(RuntimeError, match="fallback is disabled"):
-        llm._run_copilot_sdk("prompt", model="auto")
-    cli.assert_not_called()
-
-
-def test_both_transport_failures_are_reported(monkeypatch):
-    monkeypatch.setattr(
-        llm,
-        "_get_copilot_sdk_runtime",
-        MagicMock(side_effect=llm._CopilotSdkUnavailable("SDK unavailable")),
-    )
-    monkeypatch.setattr(
-        llm,
-        "_run_copilot_cli",
-        MagicMock(side_effect=RuntimeError("CLI unauthenticated")),
-    )
-
-    with pytest.raises(RuntimeError, match="Both GitHub Copilot transports failed") as exc:
-        llm._run_copilot_sdk("prompt", model="auto")
-    assert "SDK unavailable" in str(exc.value)
-    assert "CLI unauthenticated" in str(exc.value)
-
-
-def test_cli_fallback_prompt_does_not_claim_image_pixels_are_attached(
-    tmp_path, monkeypatch
-):
-    image = tmp_path / "diagram.png"
-    image.write_bytes(b"pixels")
-    ref = llm._ImageRef(image, "diagram.png", "image/png", None)
-    monkeypatch.setattr(
-        llm,
-        "_get_copilot_sdk_runtime",
-        MagicMock(side_effect=llm._CopilotSdkUnavailable("SDK unavailable")),
-    )
-    cli = MagicMock(return_value=_RESPONSE)
-    monkeypatch.setattr(llm, "_run_copilot_cli", cli)
-
-    llm._call_copilot_sdk("source", model="auto", images=[ref])
-
-    fallback_prompt = cli.call_args.args[0]
-    assert "source_file: diagram.png (not shown" in fallback_prompt
-
-
-def test_extract_files_direct_dispatches_without_api_key(tmp_path, monkeypatch):
-    source = tmp_path / "policy.md"
-    source.write_text("# Policy\n", encoding="utf-8")
-    call = MagicMock(return_value=_ok_graph([{"id": "policy"}]))
-    monkeypatch.setattr(llm, "_call_copilot_sdk", call)
-
-    result = llm.extract_files_direct(
-        [source],
-        backend="copilot-sdk",
-        root=tmp_path,
-    )
-
-    assert result["nodes"][0]["id"] == "policy"
-    call.assert_called_once()
-    assert call.call_args.kwargs["model"] == "auto"
-
-
-def test_simple_completion_path_uses_sdk(monkeypatch):
-    sdk = MagicMock(return_value="compact answer")
-    monkeypatch.setattr(llm, "_run_copilot_sdk", sdk)
-    usage = {}
-
-    out = llm._call_llm(
-        "Summarize this",
-        backend="copilot-sdk",
-        model="auto",
-        usage_out=usage,
-    )
-
-    assert out == "compact answer"
-    assert usage["input"] > 0
-    assert usage["output"] > 0
-    assert sdk.call_args.kwargs["model"] == "auto"
-
-
-def test_detect_backend_does_not_auto_select_copilot_sdk(monkeypatch):
-    for key in (
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "MOONSHOT_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_ENDPOINT",
-        "AWS_PROFILE",
-        "AWS_REGION",
-        "AWS_DEFAULT_REGION",
-        "OLLAMA_BASE_URL",
-        "OLLAMA_HOST",
-    ):
-        monkeypatch.delenv(key, raising=False)
-    assert llm.detect_backend() is None
-
-
-def test_extract_corpus_parallel_sdk_runs_serially(tmp_path, monkeypatch):
-    files = [tmp_path / f"f{i}.md" for i in range(6)]
-    for source in files:
-        source.write_text("hello", encoding="utf-8")
-
-    def fake_extract(chunk, *_, **__):
-        return _ok_graph([{"id": Path(source).stem} for source in chunk])
-
-    monkeypatch.delenv("GRAPHIFY_COPILOT_SDK_PARALLEL", raising=False)
-    with patch("graphify.llm.extract_files_direct", side_effect=fake_extract), patch(
-        "graphify.llm.ThreadPoolExecutor"
-    ) as pool:
-        result = llm.extract_corpus_parallel(
-            files,
-            backend="copilot-sdk",
-            model="auto",
-            root=tmp_path,
-            token_budget=None,
-            chunk_size=2,
-            max_concurrency=4,
+@pytest.mark.parametrize(
+    ("variable", "value", "needle"),
+    [
+        ("GRAPHIFY_COPILOT_REASONING_EFFORT", "invalid", "reasoning effort"),
+        ("GRAPHIFY_COPILOT_CONTEXT_TIER", "huge", "context tier"),
+    ],
+)
+def test_invalid_settings_fail_before_sdk(monkeypatch, variable, value, needle):
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(ValueError, match=needle):
+        backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
         )
 
-    pool.assert_not_called()
-    assert len(result["nodes"]) == 6
+
+def test_missing_optional_dependency_has_install_hint(monkeypatch):
+    monkeypatch.setitem(sys.modules, "copilot", None)
+    with pytest.raises(ImportError, match=r'graphifyy\[copilot\]'):
+        backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
 
 
-def test_sdk_runtime_reuses_client_and_denies_tools(monkeypatch):
-    state = {
-        "clients": [],
-        "sessions": [],
-        "connections": [],
-        "deleted_sessions": [],
-    }
+def test_unsupported_python_is_checked_before_sdk(monkeypatch):
+    monkeypatch.setattr(backend.sys, "version_info", (3, 10, 0))
+    with pytest.raises(RuntimeError, match="Python 3.11 or later"):
+        backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
 
-    class FakeReject:
-        def __init__(self, *, feedback):
-            self.feedback = feedback
 
-    class FakeConnection:
-        def __init__(self, path):
-            self.path = path
-            self.env = None
+def test_blob_attachments_are_inline_and_never_absolute_paths():
+    attachments = backend.blob_attachments(
+        [backend.CopilotImage(b"pixels", "image/png", "/private/source/diagram.png")]
+    )
+    assert attachments == [{
+        "type": "blob",
+        "data": base64.b64encode(b"pixels").decode("ascii"),
+        "mimeType": "image/png",
+        "displayName": "diagram.png",
+    }]
 
-        @staticmethod
-        def for_stdio(*, path):
-            value = FakeConnection(path)
-            state["connections"].append(value)
-            return value
 
+def test_helper_event_and_attachment_error_paths():
+    with pytest.raises(TypeError, match="must be bytes"):
+        backend.blob_attachments(
+            [backend.CopilotImage("not bytes", "image/png", "x")]  # pyright: ignore[reportArgumentType]
+        )
+    assert backend._system_message("") is None
+    assert backend._event_type(SimpleNamespace(type=SimpleNamespace(value="custom"))) == "custom"
+    assert backend._event_type({"raw_type": "fallback"}) == "fallback"
+    assert backend._event_type({}) == ""
+    assert backend._value({"answer": 42}, "answer") == 42
+    assert backend._value(SimpleNamespace(answer=42), "answer") == 42
+    assert backend._number(True) == 0
+    assert backend._content_from_event({"data": {"content": 123}}) is None
+    assert backend._content_from_event({"data": None}) is None
+    assert backend._content_from_event(SimpleNamespace(content=123)) is None
+
+
+def test_usage_collector_ignores_child_and_covers_message_metadata():
+    collector = backend._UsageCollector()
+    collector(SimpleNamespace(agent_id="child", type="assistant.usage", data=SimpleNamespace(input_tokens=99)))
+    assert collector.values["input_tokens"] == 0
+    collector(SimpleNamespace(
+        type="assistant.usage",
+        data=SimpleNamespace(
+            input_tokens=0, output_tokens=0, cache_read_tokens=0,
+            cache_write_tokens=0, reasoning_tokens=0, cost=None,
+            copilot_usage=SimpleNamespace(total_nano_aiu=3),
+        ),
+    ))
+    collector(SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(model="message-model", output_tokens=8),
+    ))
+    assert collector.values["copilot_usage_cost"] == 3
+    assert collector.values["output_tokens"] == 8
+    assert collector.values["model"] == "message-model"
+
+
+def test_friendly_error_categories():
+    timeout = backend.CopilotSdkTimeoutError("timeout")
+    assert backend._friendly_error(timeout, model=None) is timeout
+    assert "download-runtime" in str(backend._friendly_error(FileNotFoundError("x"), model=None))
+    assert "authentication" in str(backend._friendly_error(RuntimeError("forbidden"), model=None))
+    assert "requested" not in str(backend._friendly_error(RuntimeError("model bad"), model=None))
+    assert "m-1" in str(backend._friendly_error(RuntimeError("model bad"), model="m-1"))
+
+
+def _install_fake_copilot(monkeypatch, captured, *, response=None, fail=None):
     class FakeSession:
-        def __init__(self, kwargs):
-            self.kwargs = kwargs
-            self.send_calls = []
-            self.disconnected = False
-            state["sessions"].append(self)
-
         async def send_and_wait(self, prompt, **kwargs):
-            self.send_calls.append((prompt, kwargs))
-            return SimpleNamespace(data=SimpleNamespace(content="answer"))
+            captured["prompt"] = prompt
+            captured["send"] = kwargs
+            if fail is not None:
+                raise fail
+            return response
 
         async def disconnect(self):
-            self.disconnected = True
+            captured["disconnected"] = True
 
     class FakeClient:
         def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.started = False
-            self.stopped = False
-            state["clients"].append(self)
+            captured["client"] = kwargs
 
         async def start(self):
-            self.started = True
-
-        async def stop(self):
-            self.stopped = True
+            captured["started"] = True
 
         async def create_session(self, **kwargs):
-            return FakeSession(kwargs)
-
-        async def delete_session(self, session_id):
-            state["deleted_sessions"].append(session_id)
-
-    monkeypatch.setenv("COPILOT_GH_HOST", "example.ghe.com")
-    monkeypatch.setattr(
-        llm,
-        "_load_copilot_sdk",
-        lambda: (FakeClient, FakeConnection, FakeReject),
-    )
-
-    runtime = llm._CopilotSdkRuntime(
-        cli_path="/managed/copilot",
-        use_bundled_runtime=False,
-    )
-    try:
-        assert runtime.complete("first", model="auto") == "answer"
-        assert runtime.complete(
-            "second",
-            model="gpt-5.2",
-            attachments=[{"type": "file", "path": "/tmp/image.png"}],
-        ) == "answer"
-
-        assert len(state["clients"]) == 1
-        assert len(state["sessions"]) == 2
-        client = state["clients"][0]
-        assert client.started is True
-        connection = client.kwargs["connection"]
-        assert connection.path == "/managed/copilot"
-        assert connection.env["COPILOT_GH_HOST"] == "example.ghe.com"
-        assert connection.env["COPILOT_PLUGIN_DIR_ONLY"] == "true"
-        assert connection.env["COPILOT_HOME"] == client.kwargs["base_directory"]
-        assert client.kwargs["mode"] == "empty"
-        assert client.kwargs["use_logged_in_user"] is True
-        assert "env" not in client.kwargs
-        assert Path(client.kwargs["working_directory"]).exists()
-        assert Path(client.kwargs["base_directory"]).exists()
-
-        first = state["sessions"][0]
-        assert first.kwargs["model"] == "auto"
-        assert first.kwargs["available_tools"] == []
-        assert first.kwargs["mcp_servers"] == {}
-        assert first.kwargs["memory"] == {"enabled": False}
-        assert first.kwargs["infinite_sessions"] == {"enabled": False}
-        assert first.kwargs["enable_config_discovery"] is False
-        decision = first.kwargs["on_permission_request"](object(), {})
-        assert isinstance(decision, FakeReject)
-        assert "disables all agent tools" in decision.feedback
-        assert first.disconnected is True
-
-        second = state["sessions"][1]
-        assert second.send_calls[0][1]["attachments"] == [
-            {"type": "file", "path": "/tmp/image.png"}
-        ]
-        assert state["deleted_sessions"] == [
-            first.kwargs["session_id"],
-            second.kwargs["session_id"],
-        ]
-        assert state["deleted_sessions"][0] != state["deleted_sessions"][1]
-    finally:
-        workdir = Path(state["clients"][0].kwargs["working_directory"])
-        runtime.close()
-    assert state["clients"][0].stopped is True
-    assert not workdir.exists()
-
-
-def test_sdk_runtime_can_explicitly_use_bundled_cli(monkeypatch):
-    state = {}
-
-    class FakeReject:
-        def __init__(self, *, feedback):
-            self.feedback = feedback
-
-    class FakeConnection:
-        @staticmethod
-        def for_stdio(*, path):  # pragma: no cover - must not be called
-            raise AssertionError(path)
-
-    class FakeSession:
-        async def send_and_wait(self, prompt, **kwargs):
-            return SimpleNamespace(data=SimpleNamespace(content="ok"))
-
-        async def disconnect(self):
-            return None
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            state["kwargs"] = kwargs
-
-        async def start(self):
-            return None
-
-        async def stop(self):
-            return None
-
-        async def create_session(self, **kwargs):
+            captured["session"] = kwargs
             return FakeSession()
 
-        async def delete_session(self, session_id):
-            state["deleted_session"] = session_id
+        async def stop(self):
+            captured["stopped"] = True
 
-    monkeypatch.setattr(
-        llm,
-        "_load_copilot_sdk",
-        lambda: (FakeClient, FakeConnection, FakeReject),
+    module = types.ModuleType("copilot")
+    setattr(module, "CopilotClient", FakeClient)
+    monkeypatch.setitem(sys.modules, "copilot", module)
+
+
+def _usage_event():
+    return SimpleNamespace(
+        type="assistant.usage",
+        data=SimpleNamespace(
+            model="gpt-test",
+            input_tokens=12,
+            output_tokens=7,
+            cache_read_tokens=3,
+            cache_write_tokens=2,
+            reasoning_tokens=4,
+            cost=0.25,
+            finish_reason="stop",
+        ),
     )
-    runtime = llm._CopilotSdkRuntime(cli_path=None, use_bundled_runtime=True)
-    try:
-        assert runtime.complete("hello", model="auto") == "ok"
-        assert "connection" not in state["kwargs"]
-        assert state["kwargs"]["env"]["COPILOT_HOME"] == state["kwargs"]["base_directory"]
-        assert state["deleted_session"].startswith("graphify-")
-    finally:
-        runtime.close()
 
 
-def test_sdk_runtime_cleanup_failure_is_fatal(monkeypatch):
-    class FakeReject:
-        def __init__(self, *, feedback):
-            self.feedback = feedback
+def test_call_uses_locked_down_session_and_cleans_temp_workspace(monkeypatch):
+    captured = {}
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON, model="gpt-test", output_tokens=7),
+    )
+    _install_fake_copilot(monkeypatch, captured, response=response)
 
-    class FakeConnection:
-        env = None
+    # The fake runtime delivers usage before the final message.
+    original_create = captured
+    # Install a client variant that emits events through the callback.
+    fake_module = sys.modules["copilot"]
+    fake_client_type = fake_module.CopilotClient
+    original_session = fake_client_type
 
-        @staticmethod
-        def for_stdio(*, path):
-            return FakeConnection()
+    result = backend.call_copilot_sdk(
+        "UNTRUSTED_SOURCE", system_prompt="GRAPHIFY_SYSTEM", model=None,
+        reasoning_effort="low", context_tier="default", timeout_seconds=3,
+        images=[backend.CopilotImage(b"x", "image/png", "diagram.png")],
+    )
+    assert result["content"] == _GRAPH_JSON
+    assert captured["client"]["use_logged_in_user"] is True
+    assert captured["client"]["mode"] == "copilot-cli"
+    workdir = Path(captured["client"]["working_directory"])
+    assert not workdir.exists()
+    session = captured["session"]
+    assert session["tools"] == []
+    assert session["available_tools"] == []
+    assert session["mcp_servers"] == {}
+    for key in (
+        "enable_session_telemetry", "enable_file_change_tracking", "enable_session_store",
+        "enable_skills", "enable_config_discovery", "enable_on_demand_instruction_discovery",
+        "enable_file_hooks", "enable_host_git_operations",
+    ):
+        assert session[key] is False
+    assert session["skip_custom_instructions"] is True
+    assert session["skip_embedding_retrieval"] is True
+    assert session["memory"] == {"enabled": False}
+    assert session["system_message"]["mode"] == "customize"
+    assert captured["prompt"].startswith("Extract the knowledge graph")
+    assert captured["send"]["attachments"][0]["type"] == "blob"
+    assert captured["disconnected"] and captured["stopped"]
+
+
+def test_usage_events_aggregate(monkeypatch):
+    captured = {}
 
     class FakeSession:
         async def send_and_wait(self, prompt, **kwargs):
-            return SimpleNamespace(data=SimpleNamespace(content="answer"))
+            handler = captured["session"]["on_event"]
+            handler(_usage_event())
+            handler(SimpleNamespace(
+                type="assistant.usage",
+                data=SimpleNamespace(
+                    model="gpt-test", input_tokens=5, output_tokens=2,
+                    cache_read_tokens=1, cache_write_tokens=0,
+                    reasoning_tokens=0, cost=0.5, finish_reason="stop",
+                ),
+            ))
+            handler(SimpleNamespace(
+                type="session.usage_info",
+                data=SimpleNamespace(current_tokens=55, token_limit=100),
+            ))
+            return SimpleNamespace(type="assistant.message", data=SimpleNamespace(content=_GRAPH_JSON))
 
         async def disconnect(self):
-            return None
+            pass
 
     class FakeClient:
         def __init__(self, **kwargs):
+            captured["client"] = kwargs
+        async def start(self):
+            pass
+        async def create_session(self, **kwargs):
+            captured["session"] = kwargs
+            return FakeSession()
+        async def stop(self):
+            pass
+
+    module = types.ModuleType("copilot")
+    setattr(module, "CopilotClient", FakeClient)
+    monkeypatch.setitem(sys.modules, "copilot", module)
+    result = backend.call_copilot_sdk(
+        "source", system_prompt="system", model="m", reasoning_effort=None,
+        context_tier=None, timeout_seconds=2,
+    )
+    assert result["input_tokens"] == 17
+    assert result["output_tokens"] == 9
+    assert result["cache_read_tokens"] == 4
+    assert result["cache_write_tokens"] == 2
+    assert result["reasoning_tokens"] == 4
+    assert result["copilot_usage_cost"] == pytest.approx(0.75)
+    assert result["context_current_tokens"] == 55
+    assert result["context_limit"] == 100
+    assert result["model"] == "gpt-test"
+
+
+def test_permission_handler_returns_reject_decision(monkeypatch):
+    captured = {}
+
+    class Reject:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    generated = types.ModuleType("copilot.generated.rpc")
+    setattr(generated, "PermissionDecisionReject", Reject)
+    package = types.ModuleType("copilot.generated")
+    setattr(package, "rpc", generated)
+    monkeypatch.setitem(sys.modules, "copilot.generated", package)
+    monkeypatch.setitem(sys.modules, "copilot.generated.rpc", generated)
+    decision = backend._deny_permission(object(), object())
+    assert isinstance(decision, Reject)
+    assert "does not permit tools" in captured["feedback"]
+
+
+def test_extract_dispatches_copilot_without_api_key(tmp_path, monkeypatch):
+    source = tmp_path / "note.md"
+    source.write_text("# Alpha\n")
+    calls = {}
+
+    def fake_call(prompt, **kwargs):
+        calls.update(prompt=prompt, kwargs=kwargs)
+        return {"content": _GRAPH_JSON, "input_tokens": 2, "output_tokens": 3, "model": "m"}
+
+    monkeypatch.setattr("graphify.copilot_sdk_backend.call_copilot_sdk", fake_call)
+    result = llm.extract_files_direct([source], backend="copilot-sdk", root=tmp_path)
+    assert result["nodes"][0]["id"] == "alpha"
+    assert calls["kwargs"]["model"] is None
+    assert "untrusted_source" in calls["prompt"]
+
+
+def test_copilot_is_not_auto_detected(monkeypatch):
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "MOONSHOT_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    assert llm.detect_backend() != "copilot-sdk"
+
+
+def test_adapter_works_inside_running_event_loop(monkeypatch):
+    captured = {}
+    response = SimpleNamespace(type="assistant.message", data=SimpleNamespace(content=_GRAPH_JSON))
+    _install_fake_copilot(monkeypatch, captured, response=response)
+
+    async def run():
+        return backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
+
+    result = asyncio.run(run())
+    assert result["content"] == _GRAPH_JSON
+
+
+def test_sdk_error_does_not_echo_corpus_and_still_cleans_up(monkeypatch):
+    captured = {}
+    _install_fake_copilot(
+        monkeypatch,
+        captured,
+        fail=RuntimeError("source secret and authorization header must stay private"),
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.call_copilot_sdk(
+            "source secret", system_prompt="system", model="m", reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
+    assert "source secret" not in str(exc_info.value)
+    assert "authorization header" not in str(exc_info.value)
+    assert captured["disconnected"] and captured["stopped"]
+
+
+def test_sdk_timeout_preserves_timeout_type_and_cleanup(monkeypatch):
+    captured = {}
+    _install_fake_copilot(monkeypatch, captured, fail=asyncio.TimeoutError())
+    with pytest.raises(backend.CopilotSdkTimeoutError, match="timed out after 2 seconds"):
+        backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
+    assert captured["disconnected"] and captured["stopped"]
+
+
+def test_missing_final_assistant_message_is_actionable(monkeypatch):
+    captured = {}
+    _install_fake_copilot(monkeypatch, captured, response=None)
+    with pytest.raises(RuntimeError, match="request failed"):
+        backend.call_copilot_sdk(
+            "source", system_prompt="system", model=None, reasoning_effort=None,
+            context_tier=None, timeout_seconds=2,
+        )
+    assert captured["disconnected"] and captured["stopped"]
+
+
+@pytest.mark.parametrize("primary_failure", [False, True])
+def test_cleanup_failure_does_not_mask_primary_error(monkeypatch, primary_failure):
+    captured = {}
+
+    class FakeSession:
+        async def send_and_wait(self, _prompt, **_kwargs):
+            if primary_failure:
+                raise RuntimeError("primary extraction failure")
+            return SimpleNamespace(type="assistant.message", data=SimpleNamespace(content=_GRAPH_JSON))
+
+        async def disconnect(self):
+            raise RuntimeError("cleanup failure")
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
             pass
 
         async def start(self):
-            return None
+            pass
 
-        async def stop(self):
-            return None
-
-        async def create_session(self, **kwargs):
+        async def create_session(self, **_kwargs):
             return FakeSession()
 
-        async def delete_session(self, session_id):
-            raise RuntimeError("disk cleanup denied")
+        async def stop(self):
+            captured["stopped"] = True
 
-    monkeypatch.setattr(
-        llm,
-        "_load_copilot_sdk",
-        lambda: (FakeClient, FakeConnection, FakeReject),
-    )
-    runtime = llm._CopilotSdkRuntime(
-        cli_path="/managed/copilot",
-        use_bundled_runtime=False,
-    )
-    try:
-        with pytest.raises(RuntimeError, match="cleanup could not be verified"):
-            runtime.complete("hello", model="auto")
-    finally:
-        runtime.close()
+    module = types.ModuleType("copilot")
+    setattr(module, "CopilotClient", FakeClient)
+    monkeypatch.setitem(sys.modules, "copilot", module)
+    if primary_failure:
+        with pytest.raises(RuntimeError, match="request failed") as exc_info:
+            backend.call_copilot_sdk(
+                "source", system_prompt="system", model=None, reasoning_effort=None,
+                context_tier=None, timeout_seconds=2,
+            )
+        assert "cleanup failure" not in str(exc_info.value)
+    else:
+        with pytest.raises(RuntimeError, match="cleanup failure"):
+            backend.call_copilot_sdk(
+                "source", system_prompt="system", model=None, reasoning_effort=None,
+                context_tier=None, timeout_seconds=2,
+            )
+    assert captured["stopped"] is True
