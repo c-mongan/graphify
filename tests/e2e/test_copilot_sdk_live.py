@@ -34,7 +34,6 @@ def test_live_copilot_extracts_synthetic_relationship(tmp_path):
     assert result["edges"]
     assert any(node.get("source_file") == "fixture.md" for node in result["nodes"])
     assert any(edge.get("source_file") == "fixture.md" for edge in result["edges"])
-    if result.get("input_tokens") is not None:
-        assert result["input_tokens"] >= 0
-    if result.get("output_tokens") is not None:
-        assert result["output_tokens"] >= 0
+    assert result["input_tokens"] > 0
+    assert result["output_tokens"] > 0
+    assert result["copilot_usage_cost"] > 0

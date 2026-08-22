@@ -137,8 +137,36 @@ def test_friendly_error_categories():
     assert "m-1" in str(backend._friendly_error(RuntimeError("model bad"), model="m-1"))
 
 
+def test_session_error_surfaces_only_safe_type_and_code():
+    observer = backend._SessionObserver()
+    observer(SimpleNamespace(
+        type="session.error",
+        data=SimpleNamespace(
+            error_type="rate_limit",
+            error_code="429",
+            message="secret prompt and authorization header",
+            stack="private stack",
+        ),
+    ))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(backend._wait_for_response(
+            SimpleNamespace(get_events=lambda: None),
+            observer,
+            timeout_seconds=1,
+        ))
+
+    text = str(exc_info.value)
+    assert "rate_limit" in text
+    assert "429" in text
+    assert "secret prompt" not in text
+    assert "private stack" not in text
+
+
 def _install_fake_copilot(monkeypatch, captured, *, response=None, fail=None):
     class FakeSession:
+        session_id = "session-1"
+
         async def send(self, prompt, **kwargs):
             captured["prompt"] = prompt
             captured["send"] = kwargs
@@ -168,6 +196,9 @@ def _install_fake_copilot(monkeypatch, captured, *, response=None, fail=None):
             captured["session"] = kwargs
             kwargs["on_event"](SimpleNamespace(type="session.tools_updated", data=None))
             return FakeSession()
+
+        async def delete_session(self, session_id):
+            captured["deleted_session"] = session_id
 
         async def stop(self):
             captured["stopped"] = True
@@ -208,7 +239,7 @@ def test_call_uses_locked_down_session_and_cleans_temp_workspace(monkeypatch):
     )
     assert result["content"] == _GRAPH_JSON
     assert captured["client"]["use_logged_in_user"] is True
-    assert captured["client"]["mode"] == "copilot-cli"
+    assert captured["client"]["mode"] == "empty"
     workdir = Path(captured["client"]["working_directory"])
     assert not workdir.exists()
     session = captured["session"]
@@ -231,10 +262,32 @@ def test_call_uses_locked_down_session_and_cleans_temp_workspace(monkeypatch):
     assert captured["disconnected"] and captured["stopped"]
 
 
+def test_call_uses_empty_mode_and_permanently_deletes_session(monkeypatch):
+    captured = {}
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON),
+    )
+    _install_fake_copilot(monkeypatch, captured, response=response)
+
+    backend.call_copilot_sdk(
+        "source", system_prompt="system", model=None,
+        reasoning_effort=None, context_tier=None, timeout_seconds=3,
+    )
+
+    assert captured["client"]["mode"] == "empty"
+    assert captured["client"]["base_directory"] == captured["client"]["working_directory"]
+    assert captured["deleted_session"] == "session-1"
+    assert captured["disconnected"] is True
+    assert captured["stopped"] is True
+
+
 def test_usage_events_aggregate(monkeypatch):
     captured = {}
 
     class FakeSession:
+        session_id = "usage-session"
+
         async def send(self, prompt, **kwargs):
             handler = captured["session"]["on_event"]
             handler(_usage_event())
@@ -273,6 +326,8 @@ def test_usage_events_aggregate(monkeypatch):
             captured["session"] = kwargs
             kwargs["on_event"](SimpleNamespace(type="session.tools_updated", data=None))
             return FakeSession()
+        async def delete_session(self, session_id):
+            captured["deleted_session"] = session_id
         async def stop(self):
             pass
 
@@ -426,6 +481,8 @@ def test_history_polling_recovers_final_message_without_callback(monkeypatch):
     )
 
     class FakeSession:
+        session_id = "history-session"
+
         async def send(self, _prompt, **_kwargs):
             return "message-1"
 
@@ -445,6 +502,9 @@ def test_history_polling_recovers_final_message_without_callback(monkeypatch):
         async def create_session(self, **_kwargs):
             return FakeSession()
 
+        async def delete_session(self, _session_id):
+            pass
+
         async def stop(self):
             pass
 
@@ -463,6 +523,104 @@ def test_history_polling_recovers_final_message_without_callback(monkeypatch):
     assert result["content"] == _GRAPH_JSON
     assert result["input_tokens"] == 12
     assert result["output_tokens"] == 7
+
+
+def test_history_message_does_not_replace_callback_usage():
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON, output_tokens=8056),
+    )
+    observer = backend._SessionObserver()
+    observer(SimpleNamespace(
+        type="assistant.usage",
+        data=SimpleNamespace(
+            model="gpt-5.6-luna", input_tokens=1234, output_tokens=8056,
+            cache_read_tokens=0, cache_write_tokens=0, reasoning_tokens=0,
+            cost=2.0, finish_reason="stop",
+        ),
+    ))
+    observer(response)
+
+    class HistoryOnlyMessage:
+        async def get_events(self):
+            return [response]
+
+    final, usage = asyncio.run(backend._wait_for_response(
+        HistoryOnlyMessage(), observer, timeout_seconds=1,
+    ))
+
+    assert final is response
+    assert usage["input_tokens"] == 1234
+    assert usage["output_tokens"] == 8056
+    assert usage["copilot_usage_cost"] == pytest.approx(2.0)
+
+
+def test_waits_for_turn_end_when_usage_arrives_after_message(monkeypatch):
+    monkeypatch.setattr(backend, "_SESSION_POLL_SECONDS", 0.001)
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON, output_tokens=7),
+    )
+    turn_end = SimpleNamespace(type="assistant.turn_end", data=None)
+
+    class UsageAfterMessage:
+        def __init__(self):
+            self.polls = 0
+
+        async def get_events(self):
+            self.polls += 1
+            if self.polls == 1:
+                return [response]
+            return [response, _usage_event(), turn_end]
+
+    final, usage = asyncio.run(backend._wait_for_response(
+        UsageAfterMessage(), backend._SessionObserver(), timeout_seconds=1,
+    ))
+
+    assert final is response
+    assert usage["input_tokens"] == 12
+    assert usage["output_tokens"] == 7
+    assert usage["copilot_usage_cost"] == pytest.approx(0.25)
+
+
+def test_history_poll_is_bounded_by_request_timeout(monkeypatch):
+    monkeypatch.setattr(backend, "_SESSION_START_TIMEOUT_SECONDS", 1)
+
+    class HungHistory:
+        async def get_events(self):
+            await asyncio.Event().wait()
+
+    async def run():
+        return await asyncio.wait_for(
+            backend._wait_for_response(
+                HungHistory(), backend._SessionObserver(), timeout_seconds=0.02,
+            ),
+            timeout=0.1,
+        )
+
+    with pytest.raises(backend.CopilotSdkTimeoutError):
+        asyncio.run(run())
+
+
+def test_final_message_at_deadline_returns_best_effort_usage(monkeypatch):
+    monkeypatch.setattr(backend, "_SESSION_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(backend, "_USAGE_SETTLE_SECONDS", 0.25)
+    response = SimpleNamespace(
+        type="assistant.message",
+        data=SimpleNamespace(content=_GRAPH_JSON, output_tokens=7),
+    )
+
+    class MessageNearDeadline:
+        async def get_events(self):
+            await asyncio.sleep(0.04)
+            return [response]
+
+    final, usage = asyncio.run(backend._wait_for_response(
+        MessageNearDeadline(), backend._SessionObserver(), timeout_seconds=0.05,
+    ))
+
+    assert final is response
+    assert usage["output_tokens"] == 7
 
 
 def test_sdk_error_does_not_echo_corpus_and_still_cleans_up(monkeypatch):

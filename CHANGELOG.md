@@ -4,6 +4,8 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## 0.9.50 (2026-08-25)
 
+- Feature: add explicit `copilot-sdk` and `copilot-cli` semantic-extraction backends using the user's existing GitHub Copilot authentication, with no-tool sessions, inline image attachments, serial-by-default execution, and Python 3.11+ SDK packaging.
+- Fix: harden the Copilot SDK backend after live corpus testing: isolate session state, permanently delete sessions with bounded cleanup, retain late usage events without double-counting, sanitize errors, repair only uniquely provable shortened source paths, and require literal source-path copying.
 - Fix: Ruby methods whose names end in `!`, `?`, or `=` now keep distinct node ids, so `save` and `save!` (or `foo` and `foo=`) no longer collide into one node; the label keeps the raw spelling and member-call resolution still matches (#3077, thanks @hopstreax).
 - Fix: a Ruby call on a qualified constant receiver (`ActiveRecord::Base.transaction`) now matches the receiver's full constant path, so it no longer binds to an unrelated lone class named `Base`; an edge is emitted only on a single unambiguous match (#3078, thanks @rohit-jsfreaky).
 - Fix: a CommonJS member export wrapped in a higher-order function (`exports.x = wrap(fn)`, `module.exports.y = onCall({...}, handler)`) is now captured, reaching through the wrapper to the function it wraps without fabricating the wrapper as the export's identity (#3035, thanks @hopstreax).

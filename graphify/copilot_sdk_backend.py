@@ -38,6 +38,8 @@ _USER_INSTRUCTION = (
 _SESSION_SETTLE_SECONDS = 1.0
 _SESSION_START_TIMEOUT_SECONDS = 10.0
 _SESSION_POLL_SECONDS = 1.0
+_USAGE_SETTLE_SECONDS = 0.25
+_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 class CopilotSdkTimeoutError(TimeoutError):
@@ -46,6 +48,10 @@ class CopilotSdkTimeoutError(TimeoutError):
 
 class _CopilotSessionNotReadyError(RuntimeError):
     """Raised before source data is sent when SDK session initialization stalls."""
+
+
+class _CopilotSessionError(RuntimeError):
+    """Safe session error containing only SDK type/code metadata."""
 
 
 class _CopilotCleanupError(RuntimeError):
@@ -189,6 +195,9 @@ class _UsageCollector:
     """Collect only numeric/model metadata from SDK events."""
 
     def __init__(self) -> None:
+        self._usage_events = 0
+        self._message_output_tokens = 0
+        self._message_output_is_fallback = False
         self.values: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -209,6 +218,16 @@ class _UsageCollector:
         kind = _event_type(event)
         data = _event_data(event)
         if kind == "assistant.usage":
+            # ``assistant.message.output_tokens`` is only a fallback.  If a real
+            # usage event arrives later, remove that provisional value before
+            # accumulating the authoritative per-call totals.
+            if self._message_output_is_fallback:
+                self.values["output_tokens"] = max(
+                    0,
+                    self.values["output_tokens"] - self._message_output_tokens,
+                )
+                self._message_output_is_fallback = False
+            self._usage_events += 1
             for field in (
                 "input_tokens",
                 "output_tokens",
@@ -243,8 +262,11 @@ class _UsageCollector:
                 self.values["model"] = model
             if kind == "assistant.message":
                 output = _number(_value(data, "output_tokens", 0))
+                if output:
+                    self._message_output_tokens = max(self._message_output_tokens, output)
                 if output and not self.values["output_tokens"]:
                     self.values["output_tokens"] = output
+                    self._message_output_is_fallback = True
 
 
 class _SessionObserver:
@@ -255,7 +277,28 @@ class _SessionObserver:
         self.finished = asyncio.Event()
         self.final_message: Any = None
         self.failed = False
+        self.failure_type: str | None = None
+        self.failure_code: str | None = None
         self.started = False
+        self.turn_complete = False
+
+    @staticmethod
+    def _safe_failure_token(value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        safe = "".join(ch for ch in str(value) if ch.isalnum() or ch in "._:-")
+        return safe[:64] or None
+
+    def failure_error(self) -> _CopilotSessionError:
+        details = []
+        if self.failure_type:
+            details.append(f"type={self.failure_type}")
+        if self.failure_code:
+            details.append(f"code={self.failure_code}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        return _CopilotSessionError(
+            f"Copilot SDK session failed before producing a response{suffix}."
+        )
 
     def __call__(self, event: Any) -> None:
         self.usage(event)
@@ -274,12 +317,16 @@ class _SessionObserver:
         ):
             self.started = True
         if kind == "session.error":
+            data = _event_data(event)
+            self.failure_type = self._safe_failure_token(_value(data, "error_type"))
+            self.failure_code = self._safe_failure_token(_value(data, "error_code"))
             self.failed = True
             self.finished.set()
         elif kind == "assistant.message":
             self.final_message = event
             self.finished.set()
         elif kind in ("assistant.turn_end", "assistant.idle", "session.idle"):
+            self.turn_complete = True
             self.finished.set()
 
 
@@ -325,6 +372,29 @@ def _history_state(events: Iterable[Any]) -> tuple[bool, bool, bool, Any]:
     return started, failed, finished, final_message
 
 
+def _merge_usage_values(*snapshots: dict[str, Any]) -> dict[str, Any]:
+    """Merge duplicate callback/history usage without double-counting one call.
+
+    Session callbacks and history expose the same cumulative turn through
+    different delivery paths.  Either can lag or omit fields.  Numeric maxima
+    preserve the most complete snapshot while avoiding a sum that would bill
+    the same API call twice.
+    """
+    numeric = {
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "reasoning_tokens", "copilot_usage_cost",
+        "context_current_tokens", "context_limit",
+    }
+    merged: dict[str, Any] = {}
+    for snapshot in snapshots:
+        for key, value in snapshot.items():
+            if key in numeric:
+                merged[key] = max(_number(merged.get(key, 0)), _number(value))
+            elif value not in (None, ""):
+                merged[key] = value
+    return merged
+
+
 async def _wait_for_response(
     session: Any,
     observer: _SessionObserver,
@@ -337,28 +407,59 @@ async def _wait_for_response(
     deadline = started_at + timeout_seconds
     start_deadline = started_at + min(timeout_seconds, _SESSION_START_TIMEOUT_SECONDS)
     latest_history: list[Any] = []
+    message_seen_at: float | None = None
+    final_message: Any = None
+
+    def current_usage() -> dict[str, Any]:
+        history_usage = _UsageCollector()
+        for event in latest_history:
+            history_usage(event)
+        return _merge_usage_values(
+            dict(observer.usage.values),
+            dict(history_usage.values),
+        )
 
     while True:
         if observer.failed:
-            raise RuntimeError("Copilot SDK session failed before producing a response.")
+            raise observer.failure_error()
 
-        latest_history = list(await session.get_events())
+        now = loop.time()
+        remaining = deadline - now
+        if remaining <= 0:
+            if final_message is not None:
+                return final_message, current_usage()
+            raise CopilotSdkTimeoutError(
+                f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+            )
+        try:
+            latest_history = list(
+                await asyncio.wait_for(session.get_events(), timeout=remaining)
+            )
+        except asyncio.TimeoutError as exc:
+            final_message = observer.final_message or final_message
+            if final_message is not None:
+                return final_message, current_usage()
+            raise CopilotSdkTimeoutError(
+                f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+            ) from exc
         history_started, history_failed, history_finished, history_message = _history_state(
             latest_history
         )
         if history_failed:
             raise RuntimeError("Copilot SDK session failed before producing a response.")
-        final_message = observer.final_message or history_message
+        final_message = observer.final_message or history_message or final_message
         if final_message is not None:
-            usage = _UsageCollector()
-            if latest_history:
-                for event in latest_history:
-                    usage(event)
-                values = usage.values
-            else:
-                values = observer.usage.values
-            return final_message, dict(values)
-        if observer.finished.is_set() or history_finished:
+            now = loop.time()
+            if message_seen_at is None:
+                message_seen_at = now
+            history_turn_complete = any(
+                _event_type(event) in ("assistant.turn_end", "assistant.idle", "session.idle")
+                and _value(event, "agent_id") in (None, "")
+                for event in latest_history
+            )
+            if observer.turn_complete or history_turn_complete or now >= message_seen_at + _USAGE_SETTLE_SECONDS:
+                return final_message, current_usage()
+        if final_message is None and (observer.finished.is_set() or history_finished):
             return None, dict(observer.usage.values)
 
         now = loop.time()
@@ -367,10 +468,18 @@ async def _wait_for_response(
                 "Copilot SDK accepted the message but did not start processing it."
             )
         if now >= deadline:
+            if final_message is not None:
+                return final_message, current_usage()
             raise CopilotSdkTimeoutError(
                 f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
             )
-        await asyncio.sleep(min(_SESSION_POLL_SECONDS, deadline - now))
+        sleep_for = min(_SESSION_POLL_SECONDS, deadline - now)
+        if message_seen_at is not None:
+            sleep_for = min(
+                sleep_for,
+                max(0.0, message_seen_at + _USAGE_SETTLE_SECONDS - now),
+            )
+        await asyncio.sleep(sleep_for)
 
 
 def _deny_permission(_request: Any, _invocation: Any) -> Any:
@@ -382,6 +491,8 @@ def _deny_permission(_request: Any, _invocation: Any) -> Any:
 
 def _friendly_error(exc: BaseException, *, model: str | None) -> BaseException:
     if isinstance(exc, CopilotSdkTimeoutError):
+        return exc
+    if isinstance(exc, _CopilotSessionError):
         return exc
     if isinstance(exc, _CopilotSessionNotReadyError):
         return RuntimeError(
@@ -408,6 +519,13 @@ def _friendly_error(exc: BaseException, *, model: str | None) -> BaseException:
     return RuntimeError(f"Copilot SDK request failed ({type(exc).__name__}).")
 
 
+async def _run_cleanup(call: Callable[[], Any]) -> None:
+    """Run one SDK cleanup operation with a hard timeout."""
+    result = call()
+    if inspect.isawaitable(result):
+        await asyncio.wait_for(result, timeout=_CLEANUP_TIMEOUT_SECONDS)
+
+
 async def _call_once(
     *,
     client_type: Any,
@@ -425,6 +543,7 @@ async def _call_once(
 
     client: Any = None
     session: Any = None
+    session_id: str | None = None
     primary: BaseException | None = None
     observer = _SessionObserver()
     loop = asyncio.get_running_loop()
@@ -442,7 +561,8 @@ async def _call_once(
         with tempfile.TemporaryDirectory(prefix="graphify-copilot-") as workdir:
             client = client_type(
                 use_logged_in_user=True,
-                mode="copilot-cli",
+                mode="empty",
+                base_directory=workdir,
                 working_directory=workdir,
             )
             session_kwargs: dict[str, Any] = {
@@ -479,6 +599,7 @@ async def _call_once(
                     client.create_session(**session_kwargs),
                     timeout=remaining_timeout(),
                 )
+                session_id = _value(session, "session_id")
             except asyncio.TimeoutError as exc:
                 raise CopilotSdkTimeoutError(
                     f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
@@ -518,16 +639,19 @@ async def _call_once(
         cleanup_error: BaseException | None = None
         if session is not None:
             try:
-                result = session.disconnect()
-                if inspect.isawaitable(result):
-                    await result
+                await _run_cleanup(session.disconnect)
             except BaseException as exc:  # pragma: no cover - defensive cleanup path
                 cleanup_error = exc
+        if client is not None and session is not None:
+            try:
+                if not session_id:
+                    raise RuntimeError("Copilot SDK session has no session_id for deletion.")
+                await _run_cleanup(lambda: client.delete_session(session_id))
+            except BaseException as exc:  # pragma: no cover - defensive cleanup path
+                cleanup_error = cleanup_error or exc
         if client is not None:
             try:
-                result = client.stop()
-                if inspect.isawaitable(result):
-                    await result
+                await _run_cleanup(client.stop)
             except BaseException as exc:  # pragma: no cover - defensive cleanup path
                 cleanup_error = cleanup_error or exc
         if primary is None and cleanup_error is not None:
