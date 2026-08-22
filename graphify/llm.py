@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -488,6 +488,7 @@ You are a graphify semantic extraction agent. Extract a knowledge graph fragment
 Output ONLY valid JSON — no explanation, no markdown fences, no preamble.
 
 Rules:
+- Copy the path attribute exactly from the enclosing <untrusted_source> block into every node, edge, and hyperedge `source_file`. Never shorten it, drop leading directories, substitute a basename, URL, or referenced target path, or invent a path.
 - EXTRACTED: relationship explicit in source (import, call, citation, reference)
 - INFERRED: reasonable inference (shared data structure, implied dependency)
 - AMBIGUOUS: uncertain — flag for review, do not omit
@@ -659,6 +660,63 @@ _LABEL_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # this value does not belong to. Downstream (diagnostics) counts it.
 _VERIFICATION_FIELD = "verification"
 _UNVERIFIED_VALUE = "unverified"
+
+
+def _canonicalize_result_source_files(
+    result: dict,
+    units: "Sequence[Path | FileSlice]",
+    root: Path,
+) -> int:
+    """Restore a model-shortened ``source_file`` when the chunk proves one match.
+
+    Models sometimes drop a leading project directory from the literal path in
+    an ``<untrusted_source>`` wrapper.  Repair only against files dispatched in
+    this call, and only when the reported POSIX suffix identifies exactly one
+    file.  Ambiguous and out-of-scope paths remain untouched for the existing
+    cache and scope guards to reject visibly.
+    """
+    canonical: set[str] = set()
+    for unit in units:
+        path = unit_path(unit)
+        safe = _resolve_under_root(path, root)
+        if safe is None:
+            continue
+        try:
+            canonical.add(safe.relative_to(root.resolve()).as_posix())
+        except ValueError:
+            continue
+
+    repaired = 0
+    for bucket in ("nodes", "edges", "hyperedges"):
+        for item in result.get(bucket, []):
+            if not isinstance(item, dict):
+                continue
+            reported = item.get("source_file")
+            if not isinstance(reported, str) or not reported.strip():
+                continue
+            raw = reported.replace("\\", "/").strip()
+            parts = [part for part in raw.split("/") if part not in ("", ".")]
+            if (
+                raw.startswith("/")
+                or "://" in raw
+                or (len(raw) >= 2 and raw[1] == ":")
+                or ".." in parts
+            ):
+                continue
+            normalized = raw[2:] if raw.startswith("./") else raw
+            if normalized in canonical:
+                if reported != normalized:
+                    item["source_file"] = normalized
+                    repaired += 1
+                continue
+            matches = [
+                candidate for candidate in canonical
+                if candidate.endswith("/" + normalized)
+            ]
+            if len(matches) == 1:
+                item["source_file"] = matches[0]
+                repaired += 1
+    return repaired
 
 
 def _label_identifiers(label: str) -> list[str]:
@@ -2069,6 +2127,18 @@ def extract_files_direct(
             images=image_refs,
             extra_body=cfg.get("extra_body"),
         )
+
+    # Normalize model-shortened source paths before evidence binding and cache
+    # checkpointing.  Repair is constrained to one unique file in this request;
+    # ambiguous/out-of-scope paths remain visible to the existing safety guards.
+    if isinstance(result, dict):
+        _n_repaired = _canonicalize_result_source_files(result, files, root)
+        if _n_repaired:
+            print(
+                f"[graphify] repaired {_n_repaired} shortened source_file path(s) "
+                "from the dispatched chunk",
+                file=sys.stderr,
+            )
 
     # Verify code-typed nodes against the source the model read and downgrade the
     # confidence of any whose symbol name has no evidence there. Runs on the bytes

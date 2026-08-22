@@ -5,6 +5,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 ## Unreleased
 
 - Feature: add an explicit, optional `copilot-sdk` semantic-extraction backend using the official GitHub Copilot SDK, isolated no-tool sessions, inline image attachments, usage metadata, serial-by-default runtime calls, and Python 3.11+ packaging.
+- Fix: harden the Copilot SDK backend after live Luna corpus testing: use SDK empty mode with isolated temporary storage, permanently delete sessions with bounded cleanup, wait for late usage events without double-counting message fallbacks, preserve safe error type/code diagnostics, repair only uniquely provable model-shortened source paths, and require literal source-path copying in the extraction prompt.
 
 ## 0.9.48 (2026-08-20)
 
