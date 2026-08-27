@@ -68,7 +68,7 @@ def test_invalid_settings_fail_before_sdk(monkeypatch, variable, value, needle):
 
 def test_missing_optional_dependency_has_install_hint(monkeypatch):
     monkeypatch.setitem(sys.modules, "copilot", None)
-    with pytest.raises(ImportError, match=r'graphifyy\[copilot\]'):
+    with pytest.raises(ImportError, match=r'graphify\[copilot\]'):
         backend.call_copilot_sdk(
             "source", system_prompt="system", model=None, reasoning_effort=None,
             context_tier=None, timeout_seconds=2,
