@@ -32,8 +32,18 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
     try:
         import tree_sitter_sql as tssql
         from tree_sitter import Language, Parser
-    except ImportError:
-        return {"nodes": [], "edges": [], "error": "tree_sitter_sql not installed. Run: pip install tree-sitter-sql"}
+    except ImportError as e:
+        import importlib.util
+        # An installed-but-broken grammar (e.g. a C extension built for a
+        # different Python ABI, #2602) raises ImportError here too. Reporting
+        # that as "not installed" sends the user to a no-op `pip install`, so
+        # distinguish a genuinely-absent module from one that failed to load
+        # and surface the real exception in the latter case.
+        if importlib.util.find_spec("tree_sitter_sql") is None:
+            return {"nodes": [], "edges": [],
+                    "error": "tree_sitter_sql not installed. Run: pip install tree-sitter-sql"}
+        return {"nodes": [], "edges": [],
+                "error": f"tree_sitter_sql is installed but failed to load: {e}"}
 
     try:
         language = Language(tssql.language())
@@ -388,6 +398,10 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
         if stmt.type == "statement":
             for child in stmt.children:
                 walk(child)
+        elif stmt.type == "transaction":
+            # BEGIN; ... COMMIT; wraps DDL in a transaction node whose children
+            # are statement nodes, not direct create_table nodes (#2953).
+            walk(stmt)
         elif stmt.type in ("fb_proc_or_trigger", "set_term", "declare_external_function", "ERROR"):
             walk(stmt)
 

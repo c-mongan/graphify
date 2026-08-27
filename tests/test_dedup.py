@@ -131,7 +131,7 @@ def test_dedup_llm_flag_accepted():
 
 def test_dedup_llm_copilot_cli_does_not_require_api_key(monkeypatch):
     """Keyless CLI auth must reach the shared LLM dispatcher."""
-    nodes = _make_nodes("Authentication Manager", "Authorization Manager")
+    nodes = _make_nodes("Graph data pipeline", "Graph the pipeline")
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
@@ -151,7 +151,7 @@ def test_dedup_llm_copilot_cli_does_not_require_api_key(monkeypatch):
 
 def test_dedup_llm_copilot_sdk_does_not_require_api_key(monkeypatch):
     """SDK auth and its CLI fallback must reach the shared dispatcher."""
-    nodes = _make_nodes("Authentication Manager", "Authorization Manager")
+    nodes = _make_nodes("Graph data pipeline", "Graph the pipeline")
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
