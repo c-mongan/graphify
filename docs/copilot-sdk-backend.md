@@ -1,204 +1,150 @@
 # GitHub Copilot SDK backend
 
-Graphify's `copilot-sdk` backend uses the official Python package `github-copilot-sdk` as the preferred GitHub Copilot transport and retains the existing `copilot-cli` backend as an automatic fallback. It supports semantic extraction, LLM-assisted deduplication, community naming, PR triage, and raster-image attachments.
+Graphify can use the official Python GitHub Copilot SDK for headless semantic extraction. The backend is explicit and optional: it is never auto-selected merely because Copilot is installed. The separate `copilot-cli` backend remains directly selectable and is the compatibility fallback when an SDK request fails.
 
-The backend is explicit-only. Graphify does not select Copilot merely because the SDK package or a `copilot` executable is installed. Corpus content is sent through Copilot only after `--backend copilot-sdk` or `--backend copilot-cli` is selected.
+## Install
 
-## Architecture
+The SDK requires Python 3.11 or later. Graphify core continues to support Python 3.10.
+
+```bash
+python -m pip install "graphifyy[copilot]"
+python -m copilot download-runtime  # optional prefetch
+```
+
+On Python 3.10, the optional SDK package is not installed. An explicit `--backend copilot-sdk` request can still use the installed `copilot` CLI fallback. Select `--backend copilot-cli` directly when the CLI transport is required.
+
+## Use
+
+```bash
+graphify extract ./docs --backend copilot-sdk
+graphify extract ./docs --backend copilot-sdk --model <available-model-id>
+```
+
+For GitHub Enterprise Cloud, authenticate the official CLI and select the host before running Graphify:
+
+```bash
+copilot login --host https://example.ghe.com
+export COPILOT_GH_HOST=example.ghe.com
+graphify extract ./docs --backend copilot-sdk
+```
+
+The backend reuses the login held by the Copilot runtime. It does not require an OpenAI, Anthropic, or other provider API key.
+
+Model precedence is:
+
+1. `--model`
+2. `GRAPHIFY_COPILOT_MODEL`
+3. the account/runtime default
+
+Optional settings:
 
 ```text
-Graphify
-   |
-   | preferred
-   v
-GitHub Copilot Python SDK
-   |
-   | JSON-RPC over stdio
-   v
-Enterprise-authenticated Copilot CLI runtime
-   |
-   v
-GitHub Copilot service
-
-If SDK startup or request handling fails:
-Graphify -> one-shot copilot-cli fallback -> GitHub Copilot service
+GRAPHIFY_COPILOT_REASONING_EFFORT=low|medium|high|xhigh|max
+GRAPHIFY_COPILOT_CONTEXT_TIER=default|long_context
+GRAPHIFY_COPILOT_SDK_PARALLEL=1
+GRAPHIFY_COPILOT_SDK_FALLBACK=0
+GRAPHIFY_COPILOT_CLI_MODEL=<available-model-id>
+GRAPHIFY_COPILOT_CLI_PARALLEL=1
+GRAPHIFY_API_TIMEOUT=<seconds>
+COPILOT_HOME=<copilot state directory>
 ```
 
-Graphify keeps one SDK client and headless runtime alive for the process, but creates a new isolated session with a unique ID for every LLM request. Before returning, it disconnects and permanently deletes that session. This avoids a full runtime startup per document chunk without carrying conversation state from one Graphify request into another.
+Calls are serial by default. Parallel execution is an expert opt-in because each call starts a Copilot runtime and consumes account quota or AI credits.
 
-## Requirements and installation
+## Security and privacy boundary
 
-The official Python SDK requires Python 3.11 or newer. Graphify itself continues to support Python 3.10, so the dependency is optional and guarded by a Python-version marker.
+The backend uses SDK `empty` mode and creates a fresh session for every request.
 
-For a tool installation, choose Python 3.11 or newer explicitly:
+It explicitly disables:
+
+- tools and shell access;
+- file, Git, and host operations;
+- MCP servers and apps;
+- skills and custom instructions;
+- memory and embedding retrieval;
+- config and instruction discovery;
+- file hooks and change tracking;
+- session telemetry and session persistence;
+- remote sessions.
+
+The runtime reads the existing Copilot login from `COPILOT_HOME`, which defaults to `~/.copilot`. The session's working and configuration paths use one isolated temporary directory that is separate from `COPILOT_HOME`. It remains available until session/runtime cleanup completes and is then removed. Session persistence is disabled; the session is disconnected and the runtime is stopped under bounded cleanup, with `force_stop()` used if graceful shutdown exceeds its deadline.
+
+Graphify sends the prepared semantic source blocks and inline image bytes to the Copilot service associated with the signed-in account. Code-only AST extraction remains local and does not use this backend.
+
+Graphify surfaces only sanitized SDK error categories and suppresses the original exception chain, including timeout causes and contexts, so normal rendered tracebacks do not disclose prompt text, authorization headers, credentials, private SDK stack details, or arbitrary session-error metadata. Session error type/code diagnostics appear only when they match fixed local allowlists.
+
+## Usage accounting
+
+Graphify records:
+
+- input and output tokens;
+- cache read/write tokens when supplied;
+- reasoning tokens when supplied;
+- the model reported by the runtime;
+- Copilot's usage/credit signal.
+
+Numeric usage metadata is accepted only when it is finite, non-negative, and not boolean. Invalid values normalize to zero; valid fractional Copilot usage and arbitrary-size non-negative integers are preserved. Float totals that would overflow are capped at the largest finite float, keeping retry/corpus totals valid under strict JSON serialization. Usage is aggregated across every hollow/truncated retry and child call.
+
+A Copilot usage signal is not treated as a zero-dollar API-cost claim.
+
+Request processing uses one overall request deadline. Session readiness, start/create/send operations, history polling, and post-message usage settling share that deadline. When an operation reaches it, task supervision uses one short shared post-timeout drain/abort window rather than adding full cleanup windows. After success or failure, disconnect/stop/force-stop teardown uses one separate shared cleanup deadline, so lifecycle shutdown may add only that bounded teardown window; a successful `force_stop()` is the valid fallback when graceful `stop()` times out. Terminal callbacks race history reads so a hung read cannot hide a completion or failure. The private adapter loop closes after a final short drain. The last populated history snapshot is retained for usage accounting, terminal failure takes precedence over stale success, and the adapter checks the remaining request budget before constructing SDK awaitables.
+
+## CLI fallback
+
+Fallback is enabled by default. It covers an unavailable SDK, Python 3.10, startup and transport failures, timeouts, session failures, response failures, and cleanup failures. The fallback warning contains only a fixed failure category and does not reflect arbitrary SDK error text.
+
+Set `GRAPHIFY_COPILOT_SDK_FALLBACK=0` when the run must prove that the SDK path succeeded. A timeout can be ambiguous because the remote service might have received the request before the local deadline. Disabling fallback avoids a possible replay in workloads where duplicate model calls are unacceptable.
+
+The CLI fallback cannot attach image pixels through the SDK blob channel. It receives an accurate text-only image reference instead of a false claim that the pixels were attached. See [GitHub Copilot CLI backend](copilot-cli-backend.md) for direct CLI usage.
+
+## Troubleshooting
+
+### Authentication failure
+
+Confirm the Copilot CLI works:
 
 ```bash
-uv tool install --python 3.12 "graphifyy[copilot]"
+copilot -p "Reply exactly OK" --silent --no-custom-instructions --disable-builtin-mcps
 ```
 
-Alternative installs:
+If `COPILOT_HOME` is customized, export the same path before running Graphify.
+
+### Runtime unavailable
+
+Prefetch the SDK runtime:
 
 ```bash
-pipx install --python python3.12 "graphifyy[copilot]"
-python -m pip install "graphifyy[copilot]"
-
-# From a Graphify source checkout:
-python -m pip install -e ".[copilot]"
-```
-
-On Python 3.10, `--backend copilot-sdk` remains a valid explicit backend, but the SDK cannot load and Graphify immediately uses the installed `copilot-cli` fallback. To require the SDK and reject fallback, use Python 3.11+ and set `GRAPHIFY_COPILOT_SDK_FALLBACK=0`.
-
-## GitHub Enterprise Cloud setup
-
-Graphify uses the enterprise login and credential store owned by the official Copilot CLI. Authenticate the managed CLI first:
-
-```bash
-copilot version
-copilot login --host https://example.ghe.com
-```
-
-Pin the host when launching Graphify so another stored account cannot be selected accidentally.
-
-### bash or zsh
-
-```bash
-export COPILOT_GH_HOST=example.ghe.com
-graphify extract ./docs \
-  --backend copilot-sdk \
-  --model auto
-```
-
-### PowerShell
-
-```powershell
-$env:COPILOT_GH_HOST = "example.ghe.com"
-graphify extract ./docs `
-  --backend copilot-sdk `
-  --model auto
-```
-
-The organization or enterprise providing the Copilot seat must permit Copilot CLI/SDK use, and the requested model must be available under that policy.
-
-## Runtime selection
-
-For managed enterprise workstations, Graphify defaults to the system-installed `copilot` executable. This is the same executable authenticated with `copilot login --host ...` and is easier for administrators to inventory and approve.
-
-Resolution order is:
-
-1. `GRAPHIFY_COPILOT_SDK_CLI_PATH`
-2. `COPILOT_CLI_PATH`
-3. `copilot.cmd` on Windows, then `copilot`
-4. `copilot` on other platforms
-
-To use the SDK's version-pinned downloaded runtime instead of the system executable:
-
-```bash
-export GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI=1
 python -m copilot download-runtime
 ```
 
-Bundled-runtime mode is opt-in because it may introduce a second Copilot executable outside the workstation's normal software-management path. Authentication still comes from the signed-in user or supported token environment variables.
+### Model unavailable
 
-## Model selection
+Omit `--model` to use the account default, or choose a model available to the signed-in Copilot account.
 
-Precedence for `copilot-sdk` is:
+### Timeout
 
-1. `--model`
-2. `GRAPHIFY_COPILOT_SDK_MODEL`
-3. `GRAPHIFY_COPILOT_MODEL`
-4. `COPILOT_MODEL`
-5. `auto`
-
-`auto` lets Copilot select an eligible model. A specific model name is still subject to enterprise policy and account entitlement.
-
-The standalone `copilot-cli` backend retains its existing precedence: `--model`, `GRAPHIFY_COPILOT_CLI_MODEL`, `COPILOT_MODEL`, then `auto`.
-
-## Isolation and safety behavior
-
-For SDK requests, Graphify:
-
-- starts the client with `mode="empty"`, so ambient CLI filesystem, shell, MCP, skill, and workspace capabilities are not exposed by default;
-- uses a newly created empty temporary working directory and temporary `COPILOT_HOME` rather than the source repository or the user's normal Copilot state directory;
-- supplies an empty tool allowlist and no MCP servers;
-- rejects every permission request as a second line of defense;
-- disables persistent Copilot memory and infinite-session persistence;
-- disables remote sessions and does not configure SDK telemetry;
-- creates a fresh uniquely identified session per request, then disconnects and permanently deletes it after the response;
-- preserves `COPILOT_GH_HOST` and the normal Copilot authentication environment without parsing, printing, or persisting token values; and
-- fails closed when the installed SDK lacks any required isolation or session-deletion option, and discards the runtime if cleanup cannot be verified, then uses the separately hardened CLI fallback when enabled.
-
-The model still receives every document chunk sent for semantic extraction. These controls limit local agent capabilities; they do not constitute authorization to process any particular category of data. Enterprise policy, approved-use boundaries, and user-scoped Copilot configuration still apply.
-
-## Image handling
-
-The SDK backend sends raster images as first-class file attachments with an absolute path. The Copilot runtime reads and encodes the image. Graphify therefore does not load the image into a base64 request body.
-
-If an SDK request falls back to the one-shot CLI backend, the CLI path has no equivalent attachment channel in this integration. Graphify changes the fallback prompt so it accurately describes the image as an unseen file reference rather than claiming the pixels were attached.
-
-## Automatic CLI fallback
-
-Fallback is enabled by default. It covers Python 3.10, a missing or incompatible SDK package, runtime startup errors, JSON-RPC transport failures, request timeouts, and other SDK exceptions. Graphify prints one warning for each distinct SDK failure and runs that request through `copilot-cli`.
-
-Disable fallback when validation requires proof that the SDK path was used:
+Raise the bounded request deadline:
 
 ```bash
-export GRAPHIFY_COPILOT_SDK_FALLBACK=0
+GRAPHIFY_API_TIMEOUT=900 graphify extract ./docs --backend copilot-sdk
 ```
 
-When both transports fail, Graphify reports both causes in one error. The CLI fallback uses the same requested model and the same enterprise host/authentication environment.
+## Verification
 
-## Concurrency
-
-SDK requests are serial by default even though the runtime is persistent. Semantic extraction can generate many prompts and retries; serial dispatch avoids accidental bursts against an enterprise seat and simplifies session isolation.
-
-After validating account and policy limits, parallel dispatch can be enabled with:
+Unit tests use protocol fakes and require no account or network:
 
 ```bash
-export GRAPHIFY_COPILOT_SDK_PARALLEL=1
+uv sync --extra openai --extra copilot
+uv run pytest -q tests/test_copilot_sdk_backend.py tests/test_cli_extract_copilot_sdk.py tests/test_evidence_binding.py
 ```
 
-`--max-concurrency` then controls the upper bound. The standalone CLI transport has its own `GRAPHIFY_COPILOT_CLI_PARALLEL=1` opt-in.
-
-## Authentication troubleshooting
-
-Check the host and any token variables that can override the stored enterprise login:
+The opt-in authenticated E2E uses only a synthetic one-line fixture:
 
 ```bash
-printf '%s\n' "$COPILOT_GH_HOST"
-env | grep -E '^(COPILOT_GITHUB_TOKEN|GH_TOKEN|GITHUB_TOKEN)='
+GRAPHIFY_COPILOT_E2E=1 \
+GRAPHIFY_COPILOT_E2E_HOME="$HOME" \
+GRAPHIFY_COPILOT_E2E_MODEL=<available-model-id> \
+uv run pytest -q tests/e2e/test_copilot_sdk_live.py
 ```
 
-PowerShell:
-
-```powershell
-$env:COPILOT_GH_HOST
-Get-ChildItem Env:COPILOT_GITHUB_TOKEN,Env:GH_TOKEN,Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
-```
-
-Then validate the CLI independently and retry a small approved corpus:
-
-```bash
-copilot version
-copilot login --host https://example.ghe.com
-COPILOT_GH_HOST=example.ghe.com graphify extract ./docs \
-  --backend copilot-sdk --model auto
-```
-
-Common failures:
-
-- **SDK not installed or Python too old:** install `graphifyy[copilot]` under Python 3.11+, or permit the CLI fallback.
-- **System CLI not found:** install the official CLI, set `GRAPHIFY_COPILOT_SDK_CLI_PATH`, or explicitly opt into the SDK-downloaded runtime.
-- **Wrong account or host:** repeat the GHE.com login, set `COPILOT_GH_HOST`, and remove conflicting token variables.
-- **Login works in the standalone CLI but the SDK reports no stored login:** Graphify deliberately gives the SDK runtime a temporary `COPILOT_HOME`. OAuth credentials in the system keychain remain available, but a plaintext file fallback stored only under the user's normal `COPILOT_HOME` is not copied. Use the automatic `copilot-cli` fallback, or a policy-approved token environment variable, on hosts without a credential store.
-- **SDK/CLI version mismatch:** upgrade the system CLI or use `GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI=1` with the SDK's matching downloaded runtime.
-- **Model unavailable:** use `--model auto` or select a model enabled by enterprise policy.
-- **Timeout:** increase `GRAPHIFY_API_TIMEOUT`; Graphify discards the failed SDK runtime before the next attempt.
-- **Malformed graph JSON:** Graphify marks a hollow result as truncated and adaptively retries smaller chunks; lowering `--token-budget` can help.
-
-## Accounting and limitations
-
-The SDK response currently does not provide Graphify with provider-style token and billing fields, so Graphify records character-based token estimates and `$0` in its own provider-cost estimator. Copilot requests can still consume GitHub AI credits or another plan allowance.
-
-The repository tests replace the SDK, runtime, executable, network, and credentials with fakes. They verify lifecycle reuse, temporary Copilot state, per-request session isolation and deletion, cleanup-failure handling, tool denial, enterprise-host inheritance, image attachments, Python-version behavior, SDK-to-CLI fallback, and dispatch through extraction/deduplication/labeling/triage. They do not authenticate to an external GitHub host or transmit user data.
-
-For the standalone fallback transport, see [GitHub Copilot CLI backend](copilot-cli-backend.md).
+`GRAPHIFY_COPILOT_E2E_HOME` is required because Graphify's test harness deliberately replaces `HOME` to protect developer configuration during normal tests.

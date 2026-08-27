@@ -55,6 +55,33 @@ def _usage_add(left, right):
     if isinstance(total, float) and not math.isfinite(total):
         return max(first, second, sys.float_info.max)
     return total
+
+
+def _merged_provider_usage(*results: dict) -> dict:
+    """Merge non-core provider usage without dropping fractional values."""
+    out: dict = {}
+    for key in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+    ):
+        total = 0
+        for result in results:
+            total = _usage_add(total, result.get(key, 0))
+        if total:
+            out[key] = total
+    for key in (
+        "context_current_tokens",
+        "context_limit",
+        "model",
+        "finish_reason",
+    ):
+        for result in reversed(results):
+            if result.get(key) not in (None, ""):
+                out[key] = result[key]
+                break
+    return out
 # Coarse fallback used only when `tiktoken` is not installed. 1 token ≈ 4 chars
 # is the standard heuristic for English/code on BPE tokenizers.
 _CHARS_PER_TOKEN = 4
@@ -2222,33 +2249,36 @@ def _run_copilot_sdk(
         )
     except Exception as sdk_exc:
         failure_kind = _copilot_sdk_error_kind(sdk_exc)
-        if not _env_enabled("GRAPHIFY_COPILOT_SDK_FALLBACK", default=True):
-            raise RuntimeError(
-                "copilot-sdk failed and CLI fallback is disabled by "
-                "GRAPHIFY_COPILOT_SDK_FALLBACK=0 "
-                f"(failure category: {failure_kind})."
-            ) from None
-        if failure_kind not in _COPILOT_SDK_FALLBACK_WARNED:
-            _COPILOT_SDK_FALLBACK_WARNED.add(failure_kind)
-            print(
-                "[graphify] copilot-sdk failed "
-                f"(failure category: {failure_kind}); falling back to "
-                "copilot-cli for this request.",
-                file=sys.stderr,
-            )
-        cli_prompt = fallback_prompt or (
-            system_prompt + "\n\n---\n" + prompt if system_prompt else prompt
+
+    # Handle fallback outside the exception block. This prevents the arbitrary
+    # SDK exception object from becoming the raised error's visible context.
+    if not _env_enabled("GRAPHIFY_COPILOT_SDK_FALLBACK", default=True):
+        raise RuntimeError(
+            "copilot-sdk failed and CLI fallback is disabled by "
+            "GRAPHIFY_COPILOT_SDK_FALLBACK=0 "
+            f"(failure category: {failure_kind})."
         )
-        cli_model = model if model not in (None, "", "copilot-plan-default") else "auto"
-        text = _run_copilot_cli(cli_prompt, model=cli_model)
-        return {
-            "content": text,
-            "input_tokens": len(cli_prompt) // _CHARS_PER_TOKEN,
-            "output_tokens": len(text) // _CHARS_PER_TOKEN,
-            "model": cli_model,
-            "finish_reason": "stop",
-            "_transport": "copilot-cli",
-        }
+    if failure_kind not in _COPILOT_SDK_FALLBACK_WARNED:
+        _COPILOT_SDK_FALLBACK_WARNED.add(failure_kind)
+        print(
+            "[graphify] copilot-sdk failed "
+            f"(failure category: {failure_kind}); falling back to "
+            "copilot-cli for this request.",
+            file=sys.stderr,
+        )
+    cli_prompt = fallback_prompt or (
+        system_prompt + "\n\n---\n" + prompt if system_prompt else prompt
+    )
+    cli_model = model if model not in (None, "", "copilot-plan-default") else "auto"
+    text = _run_copilot_cli(cli_prompt, model=cli_model)
+    return {
+        "content": text,
+        "input_tokens": len(cli_prompt) // _CHARS_PER_TOKEN,
+        "output_tokens": len(text) // _CHARS_PER_TOKEN,
+        "model": cli_model,
+        "finish_reason": "stop",
+        "_transport": "copilot-cli",
+    }
 
 
 def _call_copilot_sdk(
@@ -2869,23 +2899,54 @@ def _extract_with_adaptive_retry(
     non-splittable file (e.g. one huge code file) can't be made smaller than
     itself, so we return what we got and warn.
     """
-    def _merge_two(left_units, right_units) -> dict:
+    def _with_attempt_usage(payload: dict, *prior_attempts: dict) -> dict:
+        """Keep the final payload while charging every consumed model attempt."""
+        attempts = (*prior_attempts, payload)
+        merged = dict(payload)
+        merged["input_tokens"] = 0
+        merged["output_tokens"] = 0
+        for item in attempts:
+            merged["input_tokens"] = _usage_add(
+                merged["input_tokens"], item.get("input_tokens", 0)
+            )
+            merged["output_tokens"] = _usage_add(
+                merged["output_tokens"], item.get("output_tokens", 0)
+            )
+        merged.update(_merged_provider_usage(*attempts))
+        return merged
+
+    def _merge_two(
+        left_units,
+        right_units,
+        *,
+        prior_result: dict | None = None,
+    ) -> dict:
         left = _extract_with_adaptive_retry(
             left_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
         )
         right = _extract_with_adaptive_retry(
             right_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
         )
-        return {
+        merged = {
             "nodes": left.get("nodes", []) + right.get("nodes", []),
             "edges": left.get("edges", []) + right.get("edges", []),
             "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
+            "input_tokens": _usage_add(
+                left.get("input_tokens", 0), right.get("input_tokens", 0)
+            ),
+            "output_tokens": _usage_add(
+                left.get("output_tokens", 0), right.get("output_tokens", 0)
+            ),
+            **_merged_provider_usage(left, right),
+            "model": model or left.get("model") or right.get("model"),
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
         }
+        return (
+            _with_attempt_usage(merged, prior_result)
+            if prior_result is not None
+            else merged
+        )
 
     def _split_lone_slice() -> "tuple[FileSlice, FileSlice] | None":
         # When a single-unit chunk is a slice, bisect the slice so we can retry
@@ -2907,6 +2968,7 @@ def _extract_with_adaptive_retry(
         # so it has to hold for the hollow path too: one call per chunk, full
         # stop. Bounding only the bisection depth would still let a misbehaving
         # backend triple the call count of a run that asked for no retries.
+        prior_attempts: list[dict] = []
         for _delay in (_HOLLOW_BACKOFF_S if max_depth > 0 else ()):
             if result.get("finish_reason") != "hollow":
                 break
@@ -2916,9 +2978,11 @@ def _extract_with_adaptive_retry(
                 file=sys.stderr,
             )
             time.sleep(_delay)
+            prior_attempts.append(result)
             result = extract_files_direct(
                 chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode
             )
+        result = _with_attempt_usage(result, *prior_attempts)
     except Exception as exc:  # noqa: BLE001 — re-raise unless it's a known context overflow or timeout
         is_timeout = _looks_like_timeout(exc)
         if not (_looks_like_context_exceeded(exc) or is_timeout):
@@ -2964,9 +3028,14 @@ def _extract_with_adaptive_retry(
             "nodes": left.get("nodes", []) + right.get("nodes", []),
             "edges": left.get("edges", []) + right.get("edges", []),
             "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
+            "input_tokens": _usage_add(
+                left.get("input_tokens", 0), right.get("input_tokens", 0)
+            ),
+            "output_tokens": _usage_add(
+                left.get("output_tokens", 0), right.get("output_tokens", 0)
+            ),
+            **_merged_provider_usage(left, right),
+            "model": model or left.get("model") or right.get("model"),
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
         }
@@ -3003,7 +3072,11 @@ def _extract_with_adaptive_retry(
                 f"splitting the slice and retrying",
                 file=sys.stderr,
             )
-            return _merge_two([halves[0]], [halves[1]])
+            return _merge_two(
+                [halves[0]],
+                [halves[1]],
+                prior_result=result,
+            )
         print(
             f"[graphify] single-file chunk {unit_path(chunk[0])} truncated at "
             f"max_completion_tokens — partial result kept (not cached as complete)",
@@ -3049,19 +3122,25 @@ def _extract_with_adaptive_retry(
         chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
     )
 
-    return {
+    merged = {
         "nodes": left.get("nodes", []) + right.get("nodes", []),
         "edges": left.get("edges", []) + right.get("edges", []),
         "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-        "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-        "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-        "model": result.get("model"),
+        "input_tokens": _usage_add(
+            left.get("input_tokens", 0), right.get("input_tokens", 0)
+        ),
+        "output_tokens": _usage_add(
+            left.get("output_tokens", 0), right.get("output_tokens", 0)
+        ),
+        **_merged_provider_usage(left, right),
+        "model": result.get("model") or left.get("model") or right.get("model"),
         # Both halves either succeeded or have already surfaced their own
         # truncation warning; the merged result is no longer truncated as a
         # logical unit.
         "finish_reason": "stop",
         "_partial_files": _merged_partial_files(left, right),
     }
+    return _with_attempt_usage(merged, result)
 
 
 def extract_corpus_parallel(
@@ -3377,8 +3456,28 @@ def _merge_into(merged: dict, result: dict) -> None:
     merged["nodes"].extend(result.get("nodes", []))
     merged["edges"].extend(result.get("edges", []))
     merged["hyperedges"].extend(result.get("hyperedges", []))
-    merged["input_tokens"] += result.get("input_tokens", 0)
-    merged["output_tokens"] += result.get("output_tokens", 0)
+    merged["input_tokens"] = _usage_add(
+        merged.get("input_tokens", 0), result.get("input_tokens", 0)
+    )
+    merged["output_tokens"] = _usage_add(
+        merged.get("output_tokens", 0), result.get("output_tokens", 0)
+    )
+    for key in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+    ):
+        if key in result:
+            merged[key] = _usage_add(merged.get(key, 0), result.get(key, 0))
+    for key in (
+        "context_current_tokens",
+        "context_limit",
+        "model",
+        "finish_reason",
+    ):
+        if result.get(key) not in (None, ""):
+            merged[key] = result[key]
     # Carry forward files a chunk truncated to an empty parse (#1950): these have
     # no items to ride the merge, so they'd otherwise be lost from the run-level
     # partial set the manifest stamp consults.
@@ -4000,8 +4099,30 @@ def label_communities(
         # Count tokens even for a failed batch: the LLM call was billed whether
         # or not the reply parsed.
         if usage_out is not None and batch_usage:
-            usage_out["input"] = usage_out.get("input", 0) + batch_usage.get("input", 0)
-            usage_out["output"] = usage_out.get("output", 0) + batch_usage.get("output", 0)
+            usage_out["input"] = _usage_add(
+                usage_out.get("input", 0), batch_usage.get("input", 0)
+            )
+            usage_out["output"] = _usage_add(
+                usage_out.get("output", 0), batch_usage.get("output", 0)
+            )
+            for key in (
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "copilot_usage_cost",
+            ):
+                if batch_usage.get(key):
+                    usage_out[key] = _usage_add(
+                        usage_out.get(key, 0), batch_usage[key]
+                    )
+            for key in (
+                "context_current_tokens",
+                "context_limit",
+                "model",
+                "finish_reason",
+            ):
+                if batch_usage.get(key) not in (None, ""):
+                    usage_out[key] = batch_usage[key]
         if exc is not None:
             errors[batch_idx] = exc
             start = batch_idx * batch_size

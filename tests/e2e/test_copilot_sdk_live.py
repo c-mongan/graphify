@@ -18,7 +18,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_live_copilot_extracts_synthetic_relationship(tmp_path):
+def test_live_copilot_extracts_synthetic_relationship(tmp_path, monkeypatch):
+    # The repository-wide test fixture replaces HOME to protect developer
+    # configuration. Authenticated E2E runs must explicitly opt back into the
+    # Copilot home they intend to test.
+    live_home = os.environ.get("GRAPHIFY_COPILOT_E2E_HOME")
+    if live_home:
+        monkeypatch.setenv("HOME", live_home)
+        monkeypatch.setenv("USERPROFILE", live_home)
+        monkeypatch.setenv("COPILOT_HOME", os.path.join(live_home, ".copilot"))
+
     fixture = tmp_path / "fixture.md"
     fixture.write_text(
         "Component Alpha calls Component Beta through function invoke_beta.\n",

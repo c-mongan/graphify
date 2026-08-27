@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from typing import Any, Callable, Iterable
 COPILOT_DEFAULT_MODEL = "copilot-plan-default"
 _REASONING_VALUES = frozenset({"low", "medium", "high", "xhigh", "max"})
 _CONTEXT_VALUES = frozenset({"default", "long_context"})
-_INSTALL_HINT = 'Install the backend with:\npython -m pip install "graphifyy[copilot]"'
+_INSTALL_HINT = 'Install the backend with:\npython -m pip install "graphify[copilot]"'
 _RUNTIME_HINT = (
     "The Copilot SDK runtime is not available. Pre-download it with:\n"
     "python -m copilot download-runtime"
@@ -188,7 +189,27 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def _number(value: Any) -> int | float:
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if value < 0:
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    return value
+
+
+def _add_numbers(left: Any, right: Any) -> int | float:
+    first = _number(left)
+    second = _number(right)
+    if isinstance(first, int) and isinstance(second, int):
+        return first + second
+    try:
+        total = first + second
+    except OverflowError:
+        return max(first, second, sys.float_info.max)
+    if isinstance(total, float) and not math.isfinite(total):
+        return max(first, second, sys.float_info.max)
+    return total
 
 
 class _UsageCollector:
@@ -235,12 +256,16 @@ class _UsageCollector:
                 "cache_write_tokens",
                 "reasoning_tokens",
             ):
-                self.values[field] += _number(_value(data, field, 0))
+                self.values[field] = _add_numbers(
+                    self.values[field], _value(data, field, 0)
+                )
             usage = _value(data, "copilot_usage")
             cost = _value(data, "cost")
             if cost is None and usage is not None:
                 cost = _value(usage, "total_nano_aiu")
-            self.values["copilot_usage_cost"] += _number(cost)
+            self.values["copilot_usage_cost"] = _add_numbers(
+                self.values["copilot_usage_cost"], cost
+            )
             model = _value(data, "model")
             if model:
                 self.values["model"] = model
@@ -272,6 +297,31 @@ class _UsageCollector:
 class _SessionObserver:
     """Track readiness, final output, failures, and usage from session events."""
 
+    _SAFE_FAILURE_TYPES = {
+        "authentication": "authentication",
+        "authorization": "authorization",
+        "entitlement": "entitlement",
+        "invalid_request": "invalid_request",
+        "model_unavailable": "model_unavailable",
+        "rate_limit": "rate_limit",
+        "runtime": "runtime",
+        "server_error": "server_error",
+        "timeout": "timeout",
+    }
+    _SAFE_FAILURE_CODES = {
+        "400": "400",
+        "401": "401",
+        "403": "403",
+        "404": "404",
+        "408": "408",
+        "409": "409",
+        "429": "429",
+        "500": "500",
+        "502": "502",
+        "503": "503",
+        "504": "504",
+    }
+
     def __init__(self) -> None:
         self.usage = _UsageCollector()
         self.finished = asyncio.Event()
@@ -282,12 +332,17 @@ class _SessionObserver:
         self.started = False
         self.turn_complete = False
 
-    @staticmethod
-    def _safe_failure_token(value: Any) -> str | None:
+    @classmethod
+    def _safe_failure_type(cls, value: Any) -> str | None:
         if value in (None, ""):
             return None
-        safe = "".join(ch for ch in str(value) if ch.isalnum() or ch in "._:-")
-        return safe[:64] or None
+        return cls._SAFE_FAILURE_TYPES.get(str(value).strip().lower())
+
+    @classmethod
+    def _safe_failure_code(cls, value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        return cls._SAFE_FAILURE_CODES.get(str(value).strip())
 
     def failure_error(self) -> _CopilotSessionError:
         details = []
@@ -318,8 +373,8 @@ class _SessionObserver:
             self.started = True
         if kind == "session.error":
             data = _event_data(event)
-            self.failure_type = self._safe_failure_token(_value(data, "error_type"))
-            self.failure_code = self._safe_failure_token(_value(data, "error_code"))
+            self.failure_type = self._safe_failure_type(_value(data, "error_type"))
+            self.failure_code = self._safe_failure_code(_value(data, "error_code"))
             self.failed = True
             self.finished.set()
         elif kind == "assistant.message":
@@ -400,6 +455,7 @@ async def _wait_for_response(
     observer: _SessionObserver,
     *,
     timeout_seconds: float,
+    abort: Callable[[], Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Poll history so dropped terminal events cannot strand ``send_and_wait``."""
     loop = asyncio.get_running_loop()
@@ -407,6 +463,7 @@ async def _wait_for_response(
     deadline = started_at + timeout_seconds
     start_deadline = started_at + min(timeout_seconds, _SESSION_START_TIMEOUT_SECONDS)
     latest_history: list[Any] = []
+    history_started = False
     message_seen_at: float | None = None
     final_message: Any = None
 
@@ -419,11 +476,79 @@ async def _wait_for_response(
             dict(history_usage.values),
         )
 
+    async def poll_history(timeout: float) -> tuple[list[Any], bool, bool]:
+        """Read history, waking early when a callback completes the turn."""
+        def consume_task(task: asyncio.Task[Any]) -> None:
+            try:
+                task.result()
+            except BaseException:
+                pass
+
+        history_task = asyncio.create_task(session.get_events())
+        callback_task = (
+            None
+            if observer.finished.is_set()
+            else asyncio.create_task(observer.finished.wait())
+        )
+        tasks = {history_task}
+        if callback_task is not None:
+            tasks.add(callback_task)
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            shutdown_deadline = loop.time() + min(0.05, _CLEANUP_TIMEOUT_SECONDS)
+
+            def shutdown_remaining() -> float:
+                return max(0.0, shutdown_deadline - loop.time())
+
+            drained, stubborn = await asyncio.wait(
+                pending, timeout=shutdown_remaining()
+            )
+            for task in drained:
+                consume_task(task)
+            if stubborn and abort is not None:
+                abort_task = asyncio.create_task(abort())
+                abort_done, abort_pending = await asyncio.wait(
+                    {abort_task}, timeout=shutdown_remaining()
+                )
+                for task in abort_done:
+                    consume_task(task)
+                for task in abort_pending:
+                    task.cancel()
+                    task.add_done_callback(consume_task)
+                for task in stubborn:
+                    task.cancel()
+                drained_after_abort, stubborn = await asyncio.wait(
+                    stubborn, timeout=shutdown_remaining()
+                )
+                for task in drained_after_abort:
+                    consume_task(task)
+            for task in stubborn:
+                task.add_done_callback(consume_task)
+        if history_task in done:
+            sdk_timed_out = False
+            events: list[Any] = []
+            try:
+                events = list(history_task.result())
+            except asyncio.TimeoutError:
+                sdk_timed_out = True
+            return events, sdk_timed_out, False
+        callback_completed = callback_task is not None and callback_task in done
+        return [], not callback_completed, callback_completed
+
     while True:
         if observer.failed:
             raise observer.failure_error()
 
         now = loop.time()
+        final_message = observer.final_message or final_message
+        if final_message is not None and message_seen_at is None:
+            message_seen_at = now
         remaining = deadline - now
         if remaining <= 0:
             if final_message is not None:
@@ -431,20 +556,59 @@ async def _wait_for_response(
             raise CopilotSdkTimeoutError(
                 f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
             )
-        try:
-            latest_history = list(
-                await asyncio.wait_for(session.get_events(), timeout=remaining)
+        poll_deadline = deadline
+        if not (observer.started or history_started):
+            poll_deadline = min(poll_deadline, start_deadline)
+        if message_seen_at is not None:
+            poll_deadline = min(
+                poll_deadline,
+                message_seen_at + _USAGE_SETTLE_SECONDS,
             )
-        except asyncio.TimeoutError as exc:
+        poll_timeout = max(0.0, poll_deadline - now)
+        if poll_timeout <= 0:
+            if final_message is not None:
+                return final_message, current_usage()
+            if now >= deadline:
+                raise CopilotSdkTimeoutError(
+                    f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+                )
+            if not (observer.started or history_started) and now >= start_deadline:
+                raise _CopilotSessionNotReadyError(
+                    "Copilot SDK accepted the message but did not start processing it."
+                )
+            continue
+        polled_history, history_timed_out, callback_completed = await poll_history(
+            poll_timeout
+        )
+        if observer.failed:
+            raise observer.failure_error()
+        if not history_timed_out and not callback_completed and polled_history:
+            latest_history = polled_history
+        if callback_completed:
+            final_message = observer.final_message or final_message
+            if observer.failed:
+                raise observer.failure_error()
+            if final_message is not None and message_seen_at is None:
+                message_seen_at = loop.time()
+            continue
+        if history_timed_out:
             final_message = observer.final_message or final_message
             if final_message is not None:
                 return final_message, current_usage()
-            raise CopilotSdkTimeoutError(
-                f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
-            ) from exc
-        history_started, history_failed, history_finished, history_message = _history_state(
+            now = loop.time()
+            if now >= deadline:
+                raise CopilotSdkTimeoutError(
+                    f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+                )
+            if not (observer.started or history_started) and now >= start_deadline:
+                raise _CopilotSessionNotReadyError(
+                    "Copilot SDK accepted the message but did not start processing it."
+                )
+            continue
+        current_started, history_failed, history_finished, history_message = _history_state(
             latest_history
         )
+        history_started = history_started or current_started
         if history_failed:
             raise RuntimeError("Copilot SDK session failed before producing a response.")
         final_message = observer.final_message or history_message or final_message
@@ -516,14 +680,71 @@ def _friendly_error(exc: BaseException, *, model: str | None) -> BaseException:
     # SDK exceptions can contain request payloads. Do not echo their text:
     # corpus content, image data, credentials, and authorization headers must
     # never reach Graphify's user-facing error stream.
-    return RuntimeError(f"Copilot SDK request failed ({type(exc).__name__}).")
+    return RuntimeError("Copilot SDK request failed.")
 
 
-async def _run_cleanup(call: Callable[[], Any]) -> None:
-    """Run one SDK cleanup operation with a hard timeout."""
+def _consume_task(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _run_bounded(
+    call: Callable[[], Any],
+    *,
+    timeout: float,
+    abort: Callable[[], Any] | None = None,
+) -> Any:
+    """Run an SDK operation without waiting indefinitely for cancellation."""
     result = call()
-    if inspect.isawaitable(result):
-        await asyncio.wait_for(result, timeout=_CLEANUP_TIMEOUT_SECONDS)
+    if not inspect.isawaitable(result):
+        return result
+    task = asyncio.ensure_future(result)
+    done, pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+    if done:
+        return task.result()
+    shutdown_deadline = asyncio.get_running_loop().time() + min(
+        0.05, _CLEANUP_TIMEOUT_SECONDS
+    )
+
+    def shutdown_remaining() -> float:
+        return max(0.0, shutdown_deadline - asyncio.get_running_loop().time())
+
+    task.cancel()
+    drained, pending = await asyncio.wait(
+        {task}, timeout=shutdown_remaining()
+    )
+    for completed in drained:
+        _consume_task(completed)
+    if pending and abort is not None:
+        abort_result = abort()
+        if inspect.isawaitable(abort_result):
+            abort_task = asyncio.ensure_future(abort_result)
+            abort_done, abort_pending = await asyncio.wait(
+                {abort_task}, timeout=shutdown_remaining()
+            )
+            for completed in abort_done:
+                _consume_task(completed)
+            for unfinished in abort_pending:
+                unfinished.cancel()
+                unfinished.add_done_callback(_consume_task)
+        task.cancel()
+        drained, pending = await asyncio.wait(
+            {task}, timeout=shutdown_remaining()
+        )
+        for completed in drained:
+            _consume_task(completed)
+    for unfinished in pending:
+        unfinished.add_done_callback(_consume_task)
+    raise asyncio.TimeoutError
+
+
+async def _run_cleanup(call: Callable[[], Any], *, timeout: float) -> None:
+    """Run one SDK cleanup operation with a cancellation-independent timeout."""
+    if timeout <= 0:
+        raise asyncio.TimeoutError
+    await _run_bounded(call, timeout=timeout)
 
 
 async def _call_once(
@@ -543,7 +764,7 @@ async def _call_once(
 
     client: Any = None
     session: Any = None
-    session_id: str | None = None
+    runtime_force_stopped = False
     primary: BaseException | None = None
     observer = _SessionObserver()
     loop = asyncio.get_running_loop()
@@ -557,105 +778,176 @@ async def _call_once(
             )
         return remaining
 
+    async def force_stop_runtime() -> None:
+        nonlocal runtime_force_stopped
+        if client is None:
+            return
+        force_stop = getattr(client, "force_stop", None)
+        if force_stop is None:
+            return
+        await force_stop()
+        runtime_force_stopped = True
+
+    workspace = tempfile.TemporaryDirectory(prefix="graphify-copilot-")
+    workdir = workspace.name
     try:
-        with tempfile.TemporaryDirectory(prefix="graphify-copilot-") as workdir:
-            client = client_type(
-                use_logged_in_user=True,
-                mode="empty",
-                base_directory=workdir,
-                working_directory=workdir,
+        client = client_type(
+            use_logged_in_user=True,
+            mode="empty",
+            enable_remote_sessions=False,
+            # Empty mode still needs a Copilot base directory. Use the
+            # user's configured Copilot home so the runtime can read its
+            # existing login, while the per-session working/config paths
+            # below remain isolated and temporary.
+            base_directory=os.path.expanduser(
+                os.environ.get("COPILOT_HOME", "~/.copilot")
+            ),
+            working_directory=workdir,
+        )
+        session_kwargs: dict[str, Any] = {
+            "on_permission_request": _deny_permission,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "context_tier": context_tier,
+            "streaming": True,
+            "tools": [],
+            "available_tools": [],
+            "mcp_servers": {},
+            "enable_session_telemetry": False,
+            "enable_file_change_tracking": False,
+            "enable_session_store": False,
+            "enable_skills": False,
+            "enable_config_discovery": False,
+            "enable_on_demand_instruction_discovery": False,
+            "enable_file_hooks": False,
+            "enable_host_git_operations": False,
+            "skip_custom_instructions": True,
+            "memory": {"enabled": False},
+            "embedding_cache_storage": "in-memory",
+            "mcp_oauth_token_storage": "in-memory",
+            "skip_embedding_retrieval": True,
+            "enable_mcp_apps": False,
+            "working_directory": workdir,
+            "config_directory": workdir,
+            "system_message": _system_message(system_prompt),
+            "on_event": observer,
+        }
+        startup_timed_out = False
+        try:
+            start_timeout = remaining_timeout()
+            await _run_bounded(
+                client.start,
+                timeout=start_timeout,
+                abort=(
+                    force_stop_runtime
+                    if getattr(client, "force_stop", None) is not None
+                    else None
+                ),
             )
-            session_kwargs: dict[str, Any] = {
-                "on_permission_request": _deny_permission,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "context_tier": context_tier,
-                "streaming": True,
-                "tools": [],
-                "available_tools": [],
-                "mcp_servers": {},
-                "enable_session_telemetry": False,
-                "enable_file_change_tracking": False,
-                "enable_session_store": False,
-                "enable_skills": False,
-                "enable_config_discovery": False,
-                "enable_on_demand_instruction_discovery": False,
-                "enable_file_hooks": False,
-                "enable_host_git_operations": False,
-                "skip_custom_instructions": True,
-                "memory": {"enabled": False},
-                "embedding_cache_storage": "in-memory",
-                "mcp_oauth_token_storage": "in-memory",
-                "skip_embedding_retrieval": True,
-                "enable_mcp_apps": False,
-                "working_directory": workdir,
-                "config_directory": workdir,
-                "system_message": _system_message(system_prompt),
-                "on_event": observer,
-            }
-            try:
-                await asyncio.wait_for(client.start(), timeout=remaining_timeout())
-                session = await asyncio.wait_for(
-                    client.create_session(**session_kwargs),
-                    timeout=remaining_timeout(),
-                )
-                session_id = _value(session, "session_id")
-            except asyncio.TimeoutError as exc:
-                raise CopilotSdkTimeoutError(
-                    f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
-                ) from exc
-            # The runtime can return session.create before its event forwarder
-            # is ready. A short settle avoids racing the first session.send.
-            await asyncio.sleep(min(_SESSION_SETTLE_SECONDS, remaining_timeout()))
-            try:
-                await asyncio.wait_for(
-                    session.send(
-                        user_prompt,
-                        attachments=attachments,
-                    ),
-                    timeout=remaining_timeout(),
-                )
-            except asyncio.TimeoutError as exc:
-                raise CopilotSdkTimeoutError(
-                    f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
-                ) from exc
-            final_message, usage = await _wait_for_response(
-                session,
-                observer,
-                timeout_seconds=remaining_timeout(),
+            create_timeout = remaining_timeout()
+            session = await _run_bounded(
+                lambda: client.create_session(**session_kwargs),
+                timeout=create_timeout,
+                abort=(
+                    force_stop_runtime
+                    if getattr(client, "force_stop", None) is not None
+                    else None
+                ),
             )
-            content = _content_from_event(final_message)
-            if not content or not content.strip():
-                raise RuntimeError("Copilot SDK returned no final assistant message.")
-            result = usage
-            result["content"] = content
-            result.setdefault("model", model or COPILOT_DEFAULT_MODEL)
-            result.setdefault("finish_reason", "stop")
-            return result
+        except asyncio.TimeoutError:
+            startup_timed_out = True
+        if startup_timed_out:
+            raise CopilotSdkTimeoutError(
+                f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+            )
+        # The runtime can return session.create before its event forwarder
+        # is ready. A short settle avoids racing the first session.send.
+        await asyncio.sleep(min(_SESSION_SETTLE_SECONDS, remaining_timeout()))
+        send_timed_out = False
+        try:
+            send_timeout = remaining_timeout()
+            await _run_bounded(
+                lambda: session.send(
+                    user_prompt,
+                    attachments=attachments,
+                ),
+                timeout=send_timeout,
+                abort=(
+                    force_stop_runtime
+                    if getattr(client, "force_stop", None) is not None
+                    else None
+                ),
+            )
+        except asyncio.TimeoutError:
+            send_timed_out = True
+        if send_timed_out:
+            raise CopilotSdkTimeoutError(
+                f"Copilot SDK request timed out after {timeout_seconds:g} seconds."
+            )
+        final_message, usage = await _wait_for_response(
+            session,
+            observer,
+            timeout_seconds=remaining_timeout(),
+            abort=(
+                force_stop_runtime
+                if getattr(client, "force_stop", None) is not None
+                else None
+            ),
+        )
+        content = _content_from_event(final_message)
+        if not content or not content.strip():
+            raise RuntimeError("Copilot SDK returned no final assistant message.")
+        result = usage
+        result["content"] = content
+        result.setdefault("model", model or COPILOT_DEFAULT_MODEL)
+        result.setdefault("finish_reason", "stop")
+        return result
     except BaseException as exc:
         primary = exc
         raise
     finally:
         cleanup_error: BaseException | None = None
-        if session is not None:
+        cleanup_deadline = loop.time() + _CLEANUP_TIMEOUT_SECONDS
+
+        def cleanup_remaining() -> float:
+            return max(0.0, cleanup_deadline - loop.time())
+
+        if session is not None and not runtime_force_stopped:
             try:
-                await _run_cleanup(session.disconnect)
+                # Give graceful session disconnect most of the shared budget,
+                # while retaining a bounded reserve for runtime stop/force-stop.
+                remaining = cleanup_remaining()
+                stop_reserve = min(1.0, remaining / 2)
+                await _run_cleanup(
+                    session.disconnect,
+                    timeout=remaining - stop_reserve,
+                )
             except BaseException as exc:  # pragma: no cover - defensive cleanup path
                 cleanup_error = exc
-        if client is not None and session is not None:
+        if client is not None and not runtime_force_stopped:
             try:
-                if not session_id:
-                    raise RuntimeError("Copilot SDK session has no session_id for deletion.")
-                await _run_cleanup(lambda: client.delete_session(session_id))
+                has_force_stop = getattr(client, "force_stop", None) is not None
+                stop_budget = cleanup_remaining()
+                if has_force_stop:
+                    stop_budget /= 2
+                await _run_cleanup(client.stop, timeout=stop_budget)
             except BaseException as exc:  # pragma: no cover - defensive cleanup path
-                cleanup_error = cleanup_error or exc
-        if client is not None:
-            try:
-                await _run_cleanup(client.stop)
-            except BaseException as exc:  # pragma: no cover - defensive cleanup path
-                cleanup_error = cleanup_error or exc
+                if getattr(client, "force_stop", None) is not None:
+                    try:
+                        await _run_cleanup(
+                            force_stop_runtime,
+                            timeout=cleanup_remaining(),
+                        )
+                    except BaseException as force_exc:  # pragma: no cover
+                        cleanup_error = cleanup_error or exc or force_exc
+                else:
+                    cleanup_error = cleanup_error or exc
+        try:
+            workspace.cleanup()
+        except BaseException as exc:  # pragma: no cover - defensive cleanup path
+            cleanup_error = cleanup_error or exc
         if primary is None and cleanup_error is not None:
-            raise _CopilotCleanupError("Copilot SDK cleanup failed.") from cleanup_error
+            raise _CopilotCleanupError("Copilot SDK cleanup failed.") from None
 
 
 async def _call_async(
@@ -674,6 +966,7 @@ async def _call_async(
         raise ImportError(_INSTALL_HINT) from exc
 
     attachments = blob_attachments(images)
+    sanitized_error: BaseException | None = None
     try:
         return await _call_once(
             client_type=CopilotClient,
@@ -686,24 +979,78 @@ async def _call_async(
             attachments=attachments,
         )
     except BaseException as exc:
-        if isinstance(
-            exc,
-            (ImportError, ValueError, CopilotSdkTimeoutError, _CopilotCleanupError),
-        ):
+        if isinstance(exc, (CopilotSdkTimeoutError, _CopilotCleanupError)):
             raise
-        raise _friendly_error(exc, model=model) from exc
+        # SDK exceptions may carry prompt text, credentials, headers, or stack
+        # details. Build the safe replacement here, then raise it after leaving
+        # the handler so __context__ cannot retain the raw SDK exception.
+        sanitized_error = _friendly_error(exc, model=model)
+    if sanitized_error is None:  # pragma: no cover - defensive exhaustiveness
+        raise RuntimeError("Copilot SDK request failed.")
+    raise sanitized_error
 
 
 def _run_async(factory: Callable[[], Any]) -> Any:
     """Run a coroutine in this thread or one short-lived worker thread."""
+    def run_isolated() -> Any:
+        policy = asyncio.get_event_loop_policy()
+        policy_local = getattr(policy, "_local", None)
+        uses_cpython_local = (
+            type(policy) is asyncio.DefaultEventLoopPolicy
+            and policy_local is not None
+            and hasattr(policy_local, "_loop")
+        )
+        previous_set_called = getattr(policy_local, "_set_called", False)
+        if uses_cpython_local:
+            previous_loop = getattr(policy_local, "_loop", None)
+            previous_loop_known = previous_loop is not None or previous_set_called
+        else:
+            try:
+                previous_loop = policy.get_event_loop()
+                previous_loop_known = True
+            except RuntimeError:
+                previous_loop = None
+                previous_loop_known = False
+        loop = asyncio.new_event_loop()
+        try:
+            policy.set_event_loop(loop)
+            return loop.run_until_complete(factory())
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.05))
+            for task in asyncio.all_tasks(loop):
+                # A hostile SDK coroutine may swallow CancelledError. Closing
+                # this private loop is the final local boundary; force-stop was
+                # already attempted by _run_bounded where available.
+                setattr(task, "_log_destroy_pending", False)
+                try:
+                    task.get_coro().close()
+                except BaseException:
+                    pass
+            if previous_loop is not None:
+                policy.set_event_loop(previous_loop)
+            else:
+                policy.set_event_loop(None)
+                if uses_cpython_local and not previous_loop_known:
+                    setattr(policy_local, "_set_called", False)
+            loop.close()
+
+    has_running_loop = True
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(factory())
+        has_running_loop = False
+    if not has_running_loop:
+        # Run outside the RuntimeError handler so an exception from the SDK does
+        # not inherit "no running event loop" as a misleading traceback context.
+        return run_isolated()
     # Graphify's provider API is synchronous.  A caller can still invoke it
     # from an async host, so isolate asyncio in one temporary thread.
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="graphify-copilot") as pool:
-        return pool.submit(lambda: asyncio.run(factory())).result()
+        return pool.submit(run_isolated).result()
 
 
 def call_copilot_sdk(

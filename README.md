@@ -522,10 +522,10 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `AZURE_OPENAI_DEPLOYMENT` or `GRAPHIFY_AZURE_MODEL` | Azure deployment name | optional — default `gpt-4o` |
 | `AWS_*` / `~/.aws/credentials` | AWS Bedrock — standard credential chain | `--backend bedrock` (no API key, uses IAM) |
 | `COPILOT_GH_HOST` | GitHub host inherited by the official Copilot SDK/CLI runtime, including GHE.com data-residency hosts such as `example.ghe.com` | `--backend copilot-sdk` or `copilot-cli` (recommended when multiple accounts/hosts are configured) |
-| `GRAPHIFY_COPILOT_SDK_MODEL`, `GRAPHIFY_COPILOT_MODEL`, or `COPILOT_MODEL` | Model requested from the Copilot SDK; `--model` takes precedence | optional — default `auto`, subject to enterprise policy and plan availability |
+| `GRAPHIFY_COPILOT_SDK_MODEL`, `GRAPHIFY_COPILOT_MODEL`, or `COPILOT_MODEL` | Model requested from the Copilot SDK; `--model` takes precedence | optional — the account/runtime selects its default |
 | `GRAPHIFY_COPILOT_CLI_MODEL` or `COPILOT_MODEL` | Model requested from the standalone Copilot CLI backend; `--model` takes precedence | optional — default `auto` |
-| `GRAPHIFY_COPILOT_SDK_CLI_PATH` or `COPILOT_CLI_PATH` | Managed system Copilot CLI executable used by the SDK's stdio transport | optional — defaults to `copilot` / `copilot.cmd` |
-| `GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI` | Use the SDK-downloaded version-pinned runtime instead of the system CLI | optional — set `1`; system CLI is the default for managed enterprise workstations |
+| `GRAPHIFY_COPILOT_REASONING_EFFORT` | SDK reasoning effort | optional — `low`, `medium`, `high`, `xhigh`, or `max` |
+| `GRAPHIFY_COPILOT_CONTEXT_TIER` | SDK context tier | optional — `default` or `long_context` |
 | `GRAPHIFY_COPILOT_SDK_FALLBACK` | Permit automatic fallback from `copilot-sdk` to `copilot-cli` | optional — enabled by default; set `0` to require SDK success |
 | `GRAPHIFY_COPILOT_SDK_PARALLEL` | Allow concurrent SDK sessions | optional — set `1` to opt in; serial by default |
 | `GRAPHIFY_COPILOT_CLI_PARALLEL` | Allow concurrent standalone Copilot CLI subprocesses | optional — set `1` to opt in; serial by default |
@@ -550,7 +550,7 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 
 ## GitHub Copilot SDK and CLI backends
 
-`--backend copilot-sdk` is the preferred structured integration. It uses the official Python SDK to control a persistent headless Copilot runtime over JSON-RPC, creates a fresh isolated session for each Graphify request, disconnects and permanently deletes that session after use, supports image file attachments, and automatically falls back to the existing one-shot `copilot-cli` transport when the SDK is unavailable or fails. `--backend copilot-cli` remains available as a standalone diagnostic and compatibility backend.
+`--backend copilot-sdk` is the preferred structured integration. It uses the official Python SDK with a fresh isolated client and session for each Graphify request. It supports inline image blobs, structured usage events, and automatic fallback to the one-shot `copilot-cli` transport. `--backend copilot-cli` remains directly selectable for diagnostics and compatibility.
 
 Install the optional SDK under Python 3.11 or newer, then authenticate the official CLI to the enterprise host:
 
@@ -559,23 +559,21 @@ uv tool install --python 3.12 "graphifyy[copilot]"
 copilot login --host https://example.ghe.com
 
 export COPILOT_GH_HOST=example.ghe.com
-graphify extract ./docs --backend copilot-sdk --model auto
+graphify extract ./docs --backend copilot-sdk
 ```
 
 ```powershell
 $env:COPILOT_GH_HOST = "example.ghe.com"
-graphify extract ./docs `
-  --backend copilot-sdk `
-  --model auto
+graphify extract ./docs --backend copilot-sdk
 ```
 
-Graphify defaults the SDK to the managed system `copilot` executable so it uses the same enterprise login and software-management path. Set `GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI=1` to opt into the SDK-downloaded matching runtime. On Python 3.10, the SDK package cannot load and the explicit `copilot-sdk` backend uses `copilot-cli`; set `GRAPHIFY_COPILOT_SDK_FALLBACK=0` to require SDK success.
+The SDK package requires Python 3.11 or newer. On Python 3.10, an explicit `copilot-sdk` selection can use an installed `copilot` CLI fallback. Set `GRAPHIFY_COPILOT_SDK_FALLBACK=0` to require SDK success and avoid a possible replay after an ambiguous timeout.
 
-The SDK client runs in `mode="empty"` with a temporary working directory and temporary `COPILOT_HOME`, exposes no tools or MCP servers, rejects every permission request, disables persistent memory/infinite sessions and remote sessions, and does not configure SDK telemetry. Each request uses a unique session ID; Graphify disconnects and permanently deletes the session before returning, and discards the runtime if cleanup cannot be verified. It is never auto-selected. These controls limit local agent capabilities, but the selected Copilot model still receives the source chunks and remains governed by enterprise policy and approved-use boundaries.
+The SDK client runs in `mode="empty"`. It reads the existing login from `COPILOT_HOME`, but uses temporary working and configuration paths. The session exposes no tools or MCP servers, rejects every permission request, disables persistence, memory, hooks, discovery, telemetry, and remote sessions, then stops under bounded cleanup. It is never auto-selected. These controls limit local agent capabilities, but the selected Copilot model still receives the source chunks and remains governed by enterprise policy and approved-use boundaries.
 
-SDK model precedence is `--model`, `GRAPHIFY_COPILOT_SDK_MODEL`, `GRAPHIFY_COPILOT_MODEL`, `COPILOT_MODEL`, then `auto`. Requests are serial by default; `GRAPHIFY_COPILOT_SDK_PARALLEL=1` opts into concurrency. The CLI fallback has separate `GRAPHIFY_COPILOT_CLI_MODEL` and `GRAPHIFY_COPILOT_CLI_PARALLEL` controls.
+SDK model precedence is `--model`, `GRAPHIFY_COPILOT_SDK_MODEL`, `GRAPHIFY_COPILOT_MODEL`, `COPILOT_MODEL`, then the account/runtime default. Requests are serial by default; `GRAPHIFY_COPILOT_SDK_PARALLEL=1` opts into concurrency. The CLI fallback has separate `GRAPHIFY_COPILOT_CLI_MODEL` and `GRAPHIFY_COPILOT_CLI_PARALLEL` controls.
 
-Copilot responses do not expose provider-style billing data to Graphify, so token counts are estimates and Graphify's provider-cost field is `$0`; GitHub AI credits or plan allowances can still be consumed.
+Graphify records SDK token fields and the Copilot usage signal when the runtime supplies them. That signal is not converted into a USD API-price claim. GitHub AI credits or plan allowances can still be consumed.
 
 See [`docs/copilot-sdk-backend.md`](docs/copilot-sdk-backend.md) for architecture, GitHub Enterprise setup, fallback behavior, image handling, security controls, and troubleshooting. See [`docs/copilot-cli-backend.md`](docs/copilot-cli-backend.md) for the standalone fallback transport.
 
