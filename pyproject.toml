@@ -74,7 +74,6 @@ kimi = ["openai", "tiktoken"]
 ollama = ["openai"]
 bedrock = ["boto3"]
 anthropic = ["anthropic"]
-copilot = ["github-copilot-sdk>=1.0.11,<2; python_version >= '3.11'"]
 gemini = ["openai", "tiktoken"]
 openai = ["openai", "tiktoken"]
 # The official Python SDK requires Python 3.11+. Graphify itself retains its

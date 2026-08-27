@@ -3555,25 +3555,18 @@ def dispatch_command(cmd: str) -> None:
                         sys.exit(1)
                     allow_no_key = True
                 elif backend == "copilot-sdk":
-                    from graphify.llm import (
-                        _env_enabled,
-                        _resolve_copilot_cli_command,
-                        _resolve_copilot_sdk_cli_command,
-                    )
+                    from graphify.llm import _resolve_copilot_cli_command
                     try:
-                        if _env_enabled("GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI"):
-                            # Bundled runtime is an explicit opt-in. The SDK
-                            # import itself is lazy; if absent, retain CLI as a
-                            # usable fallback when it is installed.
-                            try:
-                                import copilot as _copilot_sdk  # noqa: F401
-                            except ImportError:
-                                _resolve_copilot_cli_command()
-                        else:
-                            _resolve_copilot_sdk_cli_command()
-                    except RuntimeError as exc:
-                        print(f"error: {exc}", file=sys.stderr)
-                        sys.exit(1)
+                        import copilot as _copilot_sdk  # noqa: F401
+                    except ImportError:
+                        try:
+                            # Python 3.10 cannot install the SDK extra, but the
+                            # explicitly selected backend can still use its CLI
+                            # compatibility fallback.
+                            _resolve_copilot_cli_command()
+                        except RuntimeError as exc:
+                            print(f"error: {exc}", file=sys.stderr)
+                            sys.exit(1)
                     allow_no_key = True
                 if not allow_no_key:
                     print(

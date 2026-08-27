@@ -456,7 +456,10 @@ class TestCopilotSdkTriage:
         monkeypatch.delenv("GRAPHIFY_COPILOT_MODEL", raising=False)
         monkeypatch.delenv("COPILOT_MODEL", raising=False)
 
-        assert _resolve_triage_backend() == ("copilot-sdk", "auto")
+        assert _resolve_triage_backend() == (
+            "copilot-sdk",
+            "copilot-plan-default",
+        )
 
     def test_triage_routes_through_sdk_with_cli_fallback(self, capsys):
         pr = make_pr(number=43, title="Validate enterprise SSO")

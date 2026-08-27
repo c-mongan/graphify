@@ -4,19 +4,15 @@
 # this module provides a direct API path for non-Claude-Code environments.
 from __future__ import annotations
 
-import atexit
-import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
-import tempfile
-import threading
 import time
-import uuid
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -37,6 +33,28 @@ _FILE_CHAR_CAP = 20_000
 # delimiter block (see issue #1210); this is roughly the per-file overhead in
 # characters that wrapper adds (open tag + 64-char sha + close tag + newlines).
 _PER_FILE_OVERHEAD_CHARS = 160
+
+
+def _usage_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    return value
+
+
+def _usage_add(left, right):
+    first = _usage_number(left)
+    second = _usage_number(right)
+    if isinstance(first, int) and isinstance(second, int):
+        return first + second
+    try:
+        total = first + second
+    except OverflowError:
+        return max(first, second, sys.float_info.max)
+    if isinstance(total, float) and not math.isfinite(total):
+        return max(first, second, sys.float_info.max)
+    return total
 # Coarse fallback used only when `tiktoken` is not installed. 1 token ≈ 4 chars
 # is the standard heuristic for English/code on BPE tokenizers.
 _CHARS_PER_TOKEN = 4
@@ -236,20 +254,16 @@ BACKENDS: dict[str, dict] = {
         "max_tokens": 16384,
     },
     "copilot-sdk": {
-        # Preferred GitHub Copilot transport. The Python SDK controls a
-        # headless Copilot CLI runtime over JSON-RPC and reuses that runtime
-        # across graphify requests. Authentication remains owned by Copilot
-        # CLI, including GHE.com enterprise SSO. If SDK startup or transport
-        # fails, graphify falls back to the existing one-shot copilot-cli
-        # backend unless GRAPHIFY_COPILOT_SDK_FALLBACK=0.
-        "default_model": "auto",
+        # Preferred GitHub Copilot transport. The internal sentinel is never
+        # sent to the SDK; it lets the account/runtime select its default.
+        "default_model": "copilot-plan-default",
         "model_env_keys": [
             "GRAPHIFY_COPILOT_SDK_MODEL",
             "GRAPHIFY_COPILOT_MODEL",
             "COPILOT_MODEL",
         ],
         "pricing": {"input": 0.0, "output": 0.0},
-        "temperature": 0,
+        "temperature": None,
         "max_tokens": 16384,
         # Images are sent as SDK file attachments. The SDK/runtime handles
         # encoding and model-specific downsampling.
@@ -885,11 +899,9 @@ _IMAGE_TOKEN_ESTIMATE = 1_600
 # many for the claude-cli Read-tool loop to work through. Keeps memory and
 # request size bounded on image-dense corpora.
 _MAX_IMAGES_PER_CHUNK = 20
-# Backends that receive an image by file path instead of graphify inlining
-# base64. claude-cli opens the path with its Read tool; copilot-sdk sends a
-# first-class file attachment and lets the runtime encode/downsample it.
-# `_MAX_IMAGE_BYTES` therefore does not apply and the bytes need not be loaded.
-_PATH_IMAGE_BACKENDS = {"claude-cli", "copilot-sdk"}
+# Backends that receive an image by file path instead of Graphify inlining it.
+# The Copilot SDK adapter uses inline blobs so it never exposes host paths.
+_PATH_IMAGE_BACKENDS = {"claude-cli"}
 
 
 @dataclass
@@ -2153,16 +2165,10 @@ def _call_copilot_cli(
 
 # ── GitHub Copilot SDK transport ─────────────────────────────────────────────
 #
-# The Python SDK is async and controls a long-running, headless Copilot CLI
-# runtime over JSON-RPC. Graphify's extraction API is synchronous and may call
-# from worker threads, so the bridge below owns one dedicated asyncio loop and
-# one SDK client in a daemon thread. Each Graphify request gets a fresh SDK
-# session in an isolated temporary Copilot home. Graphify disconnects and
-# permanently deletes that session before returning while reusing the runtime.
-
-
-class _CopilotSdkUnavailable(RuntimeError):
-    """The optional Copilot SDK/runtime cannot be used in this process."""
+# SDK lifecycle, isolation, event handling, and usage collection live in the
+# focused adapter. The CLI transport stays here because it is also a directly
+# selectable backend and the explicit compatibility fallback.
+_COPILOT_SDK_FALLBACK_WARNED: set[str] = set()
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -2172,551 +2178,127 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def _load_copilot_sdk():
-    """Import the optional SDK and its typed reject decision lazily."""
-    major, minor = sys.version_info[:2]
-    if (major, minor) < (3, 11):
-        raise _CopilotSdkUnavailable(
-            "github-copilot-sdk requires Python 3.11 or newer; this Graphify "
-            f"process is running Python {major}.{minor}."
-        )
-    try:
-        from copilot import CopilotClient, RuntimeConnection
-    except ImportError as exc:
-        raise _CopilotSdkUnavailable(
-            "GitHub Copilot SDK is not installed. Install Graphify's optional "
-            "backend with `pip install \"graphifyy[copilot]\"` or install "
-            "`github-copilot-sdk>=1.0.7`."
-        ) from exc
-    try:
-        from copilot.rpc import PermissionDecisionReject
-    except ImportError:
-        # The stable SDK also re-exports permission decisions at package root;
-        # retain this import fallback for patched enterprise distributions.
-        try:
-            from copilot import PermissionDecisionReject
-        except ImportError as exc:
-            raise _CopilotSdkUnavailable(
-                "Installed github-copilot-sdk does not expose the stable "
-                "permission-decision API. Upgrade to version 1.0.7 or newer."
-            ) from exc
-    return CopilotClient, RuntimeConnection, PermissionDecisionReject
-
-
-def _copilot_sdk_child_env() -> dict[str, str]:
-    """Return a hardened environment for the SDK-managed runtime process."""
-    child_env = os.environ.copy()
-    child_env.update(
-        {
-            "COPILOT_AUTO_UPDATE": "false",
-            "COPILOT_ALLOW_ALL": "false",
-            "COPILOT_MCP_TOOL_CACHE": "false",
-            # Suppress ambient marketplace/personal plugin discovery. Graphify
-            # never supplies a plugin directory, so this leaves the set empty.
-            "COPILOT_PLUGIN_DIR_ONLY": "true",
-            "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS": "false",
-            "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS": "false",
-            "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP": "false",
-            "NO_COLOR": "1",
-        }
-    )
-    return child_env
-
-
-def _resolve_copilot_sdk_cli_command() -> str:
-    """Resolve the system CLI used by the SDK's stdio transport.
-
-    Managed enterprise deployments should use the same system binary the user has
-    authenticated with ``copilot login --host ...``. An explicit path can be
-    supplied for managed workstations; otherwise reuse the CLI backend's
-    cross-platform resolution.
-    """
-    import shutil
-
-    configured = (
-        os.environ.get("GRAPHIFY_COPILOT_SDK_CLI_PATH", "").strip()
-        or os.environ.get("COPILOT_CLI_PATH", "").strip()
-    )
-    if configured:
-        expanded = os.path.expandvars(os.path.expanduser(configured))
-        resolved = shutil.which(expanded) or expanded
-        if Path(resolved).is_file():
-            return str(Path(resolved))
-        raise _CopilotSdkUnavailable(
-            f"Configured Copilot SDK CLI path does not exist: {configured!r}."
-        )
-    return _resolve_copilot_cli_command()
-
-
-def _filter_supported_kwargs(callable_obj, kwargs: dict) -> dict:
-    """Filter keyword arguments for SDK minor-version compatibility."""
-    import inspect
-
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return kwargs
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
-        return kwargs
-    return {key: value for key, value in kwargs.items() if key in signature.parameters}
-
-
-def _require_supported_kwargs(
-    callable_obj,
-    names: set[str],
-    *,
-    api_name: str,
-) -> None:
-    """Fail closed when an SDK lacks Graphify's isolation controls.
-
-    The SDK is optional and the CLI transport remains available, so silently
-    dropping a security-relevant option is the wrong compatibility strategy.
-    Optional quality-of-life options are still filtered by
-    ``_filter_supported_kwargs``; the controls listed here must exist.
-    """
-    import inspect
-
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError) as exc:
-        raise _CopilotSdkUnavailable(
-            f"Cannot inspect {api_name}; install github-copilot-sdk>=1.0.7."
-        ) from exc
-    if any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    ):
-        return
-    missing = sorted(name for name in names if name not in signature.parameters)
-    if missing:
-        raise _CopilotSdkUnavailable(
-            f"Installed github-copilot-sdk lacks required {api_name} option(s): "
-            f"{', '.join(missing)}. Upgrade to version 1.0.7 or newer."
-        )
-
-
-def _copilot_sdk_content(response) -> str:
-    """Extract assistant text from a stable-SDK response object defensively."""
-    if response is None:
-        return ""
-    data = getattr(response, "data", None)
-    if data is None and isinstance(response, dict):
-        data = response.get("data", response)
-    content = getattr(data, "content", None)
-    if content is None and isinstance(data, dict):
-        content = data.get("content")
-    if content is None:
-        content = getattr(response, "content", None)
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, (dict, list)):
-        return json.dumps(content, ensure_ascii=False)
-    return str(content).strip()
-
-
-class _CopilotSdkRuntime:
-    """Thread-safe synchronous bridge to one persistent Copilot SDK client."""
-
-    def __init__(self, *, cli_path: str | None, use_bundled_runtime: bool):
-        self.cli_path = cli_path
-        self.use_bundled_runtime = use_bundled_runtime
-        self._client = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._start_error: BaseException | None = None
-        self._ready = threading.Event()
-        self._closed = False
-        self._workdir = tempfile.TemporaryDirectory(prefix="graphify-copilot-sdk-")
-        self._workspace = Path(self._workdir.name) / "workspace"
-        self._copilot_home = Path(self._workdir.name) / "copilot-home"
-        self._workspace.mkdir()
-        self._copilot_home.mkdir()
-        self._thread = threading.Thread(
-            target=self._thread_main,
-            name="graphify-copilot-sdk",
-            daemon=True,
-        )
-        self._thread.start()
-        startup_timeout = max(5.0, min(_resolve_api_timeout(), 120.0))
-        if not self._ready.wait(startup_timeout):
-            self.close()
-            raise _CopilotSdkUnavailable(
-                f"Copilot SDK runtime did not start within {startup_timeout:g} "
-                "seconds. Increase GRAPHIFY_API_TIMEOUT for a slower enterprise "
-                "workstation, or use --backend copilot-cli."
-            )
-        if self._start_error is not None:
-            error = self._start_error
-            self.close()
-            raise _CopilotSdkUnavailable(f"Copilot SDK runtime failed to start: {error}") from error
-
-    def _thread_main(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        try:
-            timeout = max(5.0, min(_resolve_api_timeout(), 120.0))
-            loop.run_until_complete(asyncio.wait_for(self._async_start(), timeout=timeout))
-        except BaseException as exc:  # captured and raised by the constructing thread
-            self._start_error = exc
-            self._ready.set()
-        else:
-            self._ready.set()
-            loop.run_forever()
-        finally:
-            try:
-                loop.run_until_complete(self._async_stop())
-            except BaseException:
-                pass
-            loop.close()
-
-    async def _async_start(self) -> None:
-        CopilotClient, RuntimeConnection, reject_type = _load_copilot_sdk()
-        self._reject_type = reject_type
-        connection = None
-        child_env = _copilot_sdk_child_env()
-        # Keep runtime config and session data out of the user's normal
-        # Copilot home. Logged-in-user authentication still comes from the
-        # system credential store; this directory is deleted with the runtime.
-        child_env["COPILOT_HOME"] = str(self._copilot_home)
-        required_client_options = {
-            "base_directory",
-            "working_directory",
-            "use_logged_in_user",
-            "enable_remote_sessions",
-            "mode",
-        }
-        if not self.use_bundled_runtime:
-            required_client_options.add("connection")
-            connection = RuntimeConnection.for_stdio(path=self.cli_path)
-            # Stable SDKs require child-process environment variables to live
-            # on RuntimeConnection when an explicit stdio/tcp connection is
-            # supplied; setting both connection.env and CopilotClient(env=...)
-            # is rejected. Keeping the hardened environment on the connection
-            # also makes the process boundary explicit.
-            connection.env = child_env
-        client_kwargs = {
-            "connection": connection,
-            "base_directory": str(self._copilot_home),
-            "working_directory": str(self._workspace),
-            "use_logged_in_user": True,
-            # Current stable naming plus the previous SDK spelling; signature
-            # filtering keeps only the one supported by the installed version.
-            "enable_remote_sessions": False,
-            "remote": False,
-            # Empty mode disables ambient filesystem/shell/MCP/skill defaults.
-            "mode": "empty",
-        }
-        if connection is None:
-            client_kwargs.pop("connection")
-            required_client_options.add("env")
-            # The SDK-managed bundled runtime has no caller-created connection,
-            # so client-level env is the supported way to harden its process.
-            client_kwargs["env"] = child_env
-        _require_supported_kwargs(
-            CopilotClient,
-            required_client_options,
-            api_name="CopilotClient",
-        )
-        self._client = CopilotClient(
-            **_filter_supported_kwargs(CopilotClient, client_kwargs)
-        )
-        if not callable(getattr(self._client, "delete_session", None)):
-            raise _CopilotSdkUnavailable(
-                "Installed github-copilot-sdk lacks CopilotClient.delete_session; "
-                "upgrade to version 1.0.7 or newer."
-            )
-        await self._client.start()
-
-    async def _async_stop(self) -> None:
-        client, self._client = self._client, None
-        if client is not None:
-            stop = getattr(client, "stop", None)
-            if stop is not None:
-                await stop()
-
-    def _deny_permission(self, _request, _invocation=None):
-        return self._reject_type(
-            feedback="Graphify's copilot-sdk backend disables all agent tools."
-        )
-
-    async def _async_complete(
-        self,
-        prompt: str,
-        *,
-        model: str,
-        attachments: list[dict] | None,
-        timeout_s: float,
-    ) -> str:
-        if self._client is None:
-            raise _CopilotSdkUnavailable("Copilot SDK client is not running.")
-        session_id = f"graphify-{os.getpid()}-{uuid.uuid4().hex}"
-        session_kwargs = {
-            "model": model,
-            "session_id": session_id,
-            "on_permission_request": self._deny_permission,
-            "available_tools": [],
-            "mcp_servers": {},
-            "memory": {"enabled": False},
-            "infinite_sessions": {"enabled": False},
-            "enable_config_discovery": False,
-            "enable_session_telemetry": False,
-        }
-        create_session = self._client.create_session
-        _require_supported_kwargs(
-            create_session,
-            {
-                "model",
-                "session_id",
-                "on_permission_request",
-                "available_tools",
-                "mcp_servers",
-                "memory",
-                "infinite_sessions",
-                "enable_config_discovery",
-            },
-            api_name="CopilotClient.create_session",
-        )
-        session = await create_session(
-            **_filter_supported_kwargs(create_session, session_kwargs)
-        )
-        response = None
-        request_error: BaseException | None = None
-        try:
-            send_kwargs = {"attachments": attachments} if attachments else {}
-            response = await asyncio.wait_for(
-                session.send_and_wait(prompt, **send_kwargs),
-                timeout=timeout_s,
-            )
-        except BaseException as exc:
-            request_error = exc
-        finally:
-            cleanup_errors: list[str] = []
-            disconnect = getattr(session, "disconnect", None)
-            if disconnect is not None:
-                try:
-                    await disconnect()
-                except BaseException as exc:
-                    cleanup_errors.append(f"disconnect failed: {exc}")
-            try:
-                await self._client.delete_session(session_id)
-            except BaseException as exc:
-                cleanup_errors.append(f"session deletion failed: {exc}")
-            if cleanup_errors:
-                detail = "; ".join(cleanup_errors)
-                if request_error is not None:
-                    detail = f"request failed: {request_error}; {detail}"
-                raise RuntimeError(
-                    "Copilot SDK request cleanup could not be verified; the "
-                    f"runtime will be discarded ({detail})."
-                ) from (request_error or None)
-        if request_error is not None:
-            raise request_error
-        text = _copilot_sdk_content(response)
-        if not text:
-            raise RuntimeError("Copilot SDK returned no assistant text.")
-        return text
-
-    def complete(
-        self,
-        prompt: str,
-        *,
-        model: str,
-        attachments: list[dict] | None = None,
-    ) -> str:
-        if self._closed or self._loop is None or not self._thread.is_alive():
-            raise _CopilotSdkUnavailable("Copilot SDK runtime is not available.")
-        timeout_s = _resolve_api_timeout()
-        future = asyncio.run_coroutine_threadsafe(
-            self._async_complete(
-                prompt,
-                model=model,
-                attachments=attachments,
-                timeout_s=timeout_s,
-            ),
-            self._loop,
-        )
-        try:
-            return future.result(timeout=timeout_s + 5.0)
-        except TimeoutError as exc:
-            future.cancel()
-            raise RuntimeError(
-                f"Copilot SDK timed out after {timeout_s:g} seconds. Increase "
-                "GRAPHIFY_API_TIMEOUT or use --backend copilot-cli."
-            ) from exc
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            try:
-                future = asyncio.run_coroutine_threadsafe(self._async_stop(), loop)
-                future.result(timeout=5.0)
-            except BaseException:
-                pass
-            loop.call_soon_threadsafe(loop.stop)
-        if self._thread.is_alive() and threading.current_thread() is not self._thread:
-            self._thread.join(timeout=5.0)
-        self._workdir.cleanup()
-
-
-_COPILOT_SDK_RUNTIME: _CopilotSdkRuntime | None = None
-_COPILOT_SDK_RUNTIME_SIGNATURE: tuple | None = None
-_COPILOT_SDK_RUNTIME_LOCK = threading.Lock()
-_COPILOT_SDK_FALLBACK_WARNED: set[str] = set()
-
-
-def _copilot_sdk_signature(*, cli_path: str | None, bundled: bool) -> tuple:
-    auth_material = "\0".join(
-        os.environ.get(name, "")
-        for name in (
-            "COPILOT_GH_HOST",
-            "GH_HOST",
-            "COPILOT_GITHUB_TOKEN",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "COPILOT_HOME",
-            "HOME",
-            "USERPROFILE",
-        )
-    )
-    auth_fingerprint = hashlib.sha256(auth_material.encode("utf-8")).hexdigest()
-    return (os.getpid(), bundled, cli_path, auth_fingerprint)
-
-
-def _get_copilot_sdk_runtime() -> _CopilotSdkRuntime:
-    global _COPILOT_SDK_RUNTIME, _COPILOT_SDK_RUNTIME_SIGNATURE
-
-    bundled = _env_enabled("GRAPHIFY_COPILOT_SDK_USE_BUNDLED_CLI")
-    cli_path = None if bundled else _resolve_copilot_sdk_cli_command()
-    signature = _copilot_sdk_signature(cli_path=cli_path, bundled=bundled)
-    with _COPILOT_SDK_RUNTIME_LOCK:
-        if (
-            _COPILOT_SDK_RUNTIME is not None
-            and _COPILOT_SDK_RUNTIME_SIGNATURE == signature
-        ):
-            return _COPILOT_SDK_RUNTIME
-        if _COPILOT_SDK_RUNTIME is not None:
-            _COPILOT_SDK_RUNTIME.close()
-        runtime = _CopilotSdkRuntime(
-            cli_path=cli_path,
-            use_bundled_runtime=bundled,
-        )
-        _COPILOT_SDK_RUNTIME = runtime
-        _COPILOT_SDK_RUNTIME_SIGNATURE = signature
-        return runtime
-
-
-def _discard_copilot_sdk_runtime() -> None:
-    global _COPILOT_SDK_RUNTIME, _COPILOT_SDK_RUNTIME_SIGNATURE
-
-    with _COPILOT_SDK_RUNTIME_LOCK:
-        runtime, _COPILOT_SDK_RUNTIME = _COPILOT_SDK_RUNTIME, None
-        _COPILOT_SDK_RUNTIME_SIGNATURE = None
-    if runtime is not None:
-        runtime.close()
-
-
-atexit.register(_discard_copilot_sdk_runtime)
+def _copilot_sdk_error_kind(exc: BaseException) -> str:
+    """Return a fixed diagnostic label without reflecting SDK exception text."""
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ImportError):
+        return "unavailable"
+    if isinstance(exc, ValueError):
+        return "configuration"
+    return "runtime"
 
 
 def _run_copilot_sdk(
     prompt: str,
     *,
-    model: str,
-    attachments: list[dict] | None = None,
+    system_prompt: str,
+    model: str | None,
+    images: list[_ImageRef] | None = None,
     fallback_prompt: str | None = None,
-) -> str:
-    """Complete through the SDK, automatically falling back to copilot-cli."""
+) -> dict:
+    """Complete through the isolated SDK adapter, with an optional CLI fallback."""
+    from graphify.copilot_sdk_backend import CopilotImage, call_copilot_sdk
+
+    inline_images = [
+        CopilotImage(
+            data=ref.raw,
+            mime_type=ref.media_type,
+            display_name=ref.rel,
+        )
+        for ref in images or []
+        if ref.raw is not None
+    ]
+    sdk_model = None if model in (None, "", "copilot-plan-default") else model
     try:
-        return _get_copilot_sdk_runtime().complete(
+        return call_copilot_sdk(
             prompt,
-            model=model,
-            attachments=attachments,
+            system_prompt=system_prompt,
+            model=sdk_model,
+            reasoning_effort=None,
+            context_tier=None,
+            timeout_seconds=_resolve_api_timeout(),
+            images=inline_images,
         )
     except Exception as sdk_exc:
-        _discard_copilot_sdk_runtime()
+        failure_kind = _copilot_sdk_error_kind(sdk_exc)
         if not _env_enabled("GRAPHIFY_COPILOT_SDK_FALLBACK", default=True):
             raise RuntimeError(
                 "copilot-sdk failed and CLI fallback is disabled by "
-                f"GRAPHIFY_COPILOT_SDK_FALLBACK=0: {sdk_exc}"
-            ) from sdk_exc
-        warning_key = type(sdk_exc).__name__ + ":" + str(sdk_exc)
-        if warning_key not in _COPILOT_SDK_FALLBACK_WARNED:
-            _COPILOT_SDK_FALLBACK_WARNED.add(warning_key)
+                "GRAPHIFY_COPILOT_SDK_FALLBACK=0 "
+                f"(failure category: {failure_kind})."
+            ) from None
+        if failure_kind not in _COPILOT_SDK_FALLBACK_WARNED:
+            _COPILOT_SDK_FALLBACK_WARNED.add(failure_kind)
             print(
-                f"[graphify] copilot-sdk unavailable ({sdk_exc}); falling back "
-                "to copilot-cli for this request.",
+                "[graphify] copilot-sdk failed "
+                f"(failure category: {failure_kind}); falling back to "
+                "copilot-cli for this request.",
                 file=sys.stderr,
             )
-        try:
-            return _run_copilot_cli(fallback_prompt or prompt, model=model)
-        except Exception as cli_exc:
-            raise RuntimeError(
-                "Both GitHub Copilot transports failed. "
-                f"copilot-sdk: {sdk_exc}; copilot-cli fallback: {cli_exc}"
-            ) from cli_exc
+        cli_prompt = fallback_prompt or (
+            system_prompt + "\n\n---\n" + prompt if system_prompt else prompt
+        )
+        cli_model = model if model not in (None, "", "copilot-plan-default") else "auto"
+        text = _run_copilot_cli(cli_prompt, model=cli_model)
+        return {
+            "content": text,
+            "input_tokens": len(cli_prompt) // _CHARS_PER_TOKEN,
+            "output_tokens": len(text) // _CHARS_PER_TOKEN,
+            "model": cli_model,
+            "finish_reason": "stop",
+            "_transport": "copilot-cli",
+        }
 
 
 def _call_copilot_sdk(
     user_message: str,
     max_tokens: int = 8192,
     *,
-    model: str = "auto",
+    model: str | None = None,
     deep_mode: bool = False,
     images: list[_ImageRef] | None = None,
 ) -> dict:
-    """Extract a graph through the Copilot SDK with CLI fallback."""
+    """Extract a graph through the isolated Copilot SDK with CLI fallback."""
     refs = images or []
-    sdk_user_message = _with_image_notes(
-        user_message,
-        refs,
-        file_attachments=True,
+    sdk_user_message = _with_image_notes(user_message, refs)
+    system_prompt = _extraction_system(deep=deep_mode)
+    cli_message = (
+        system_prompt
+        + "\n\n---\n"
+        + "Now extract the knowledge graph from the following source file(s) "
+        + "and output ONLY the JSON object described above. No prose, no "
+        + "preamble, no markdown fences. Keep the JSON response within "
+        + f"approximately {max_tokens} tokens.\n\n"
+        + sdk_user_message
     )
-    # The one-shot CLI fallback has no SDK attachment channel. Its alternate
-    # prompt therefore labels those images as unseen references rather than
-    # incorrectly claiming pixels were attached.
-    cli_user_message = _with_image_notes(user_message, refs)
-
-    def _combined(message: str) -> str:
-        return (
-            _extraction_system(deep=deep_mode)
-            + "\n\n---\n"
-            + "Now extract the knowledge graph from the following source file(s) "
-            + "and output ONLY the JSON object described above. No prose, no "
-            + "preamble, no markdown fences. Keep the JSON response within "
-            + f"approximately {max_tokens} tokens.\n\n"
-            + message
-        )
-
-    combined_message = _combined(sdk_user_message)
-    fallback_message = _combined(cli_user_message)
-    attachments = [
-        {"type": "file", "path": str(ref.path.resolve())}
-        for ref in refs
-    ]
-    raw_content = _run_copilot_sdk(
-        combined_message,
+    response = _run_copilot_sdk(
+        sdk_user_message,
+        system_prompt=system_prompt,
         model=model,
-        attachments=attachments or None,
-        fallback_prompt=fallback_message,
+        images=refs,
+        fallback_prompt=cli_message,
     )
+    raw_content = str(response.get("content") or "")
     result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = len(combined_message) // _CHARS_PER_TOKEN
-    result["output_tokens"] = len(raw_content) // _CHARS_PER_TOKEN
-    result["model"] = model
-    result["finish_reason"] = "stop"
-    if _response_is_hollow(raw_content, result):
-        print(
-            "[graphify] copilot-sdk returned a hollow response; treating as "
-            "truncation so adaptive retry can bisect the chunk.",
-            file=sys.stderr,
-        )
-        result["finish_reason"] = "length"
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "copilot_usage_cost",
+        "context_current_tokens",
+        "context_limit",
+    ):
+        if response.get(key) not in (None, ""):
+            result[key] = response[key]
+    result["model"] = response.get("model") or model or "copilot-plan-default"
+    result["finish_reason"] = response.get("finish_reason") or "stop"
+    _mark_hollow(result, raw_content, "copilot-sdk")
     return result
+
+
 
 
 def _azure_client(api_key: str, endpoint: str):
@@ -3937,16 +3519,37 @@ def _call_llm(
             + "\n\nReturn only the requested answer and keep it within "
             + f"approximately {max_tokens} tokens."
         )
-        text = _run_copilot_sdk(
+        response = _run_copilot_sdk(
             completion_prompt,
+            system_prompt="",
             model=mdl,
             fallback_prompt=completion_prompt,
         )
-        _rec(
-            len(completion_prompt) // _CHARS_PER_TOKEN,
-            len(text) // _CHARS_PER_TOKEN,
-        )
-        return text
+        if usage_out is not None:
+            usage_out["input"] = _usage_add(
+                usage_out.get("input", 0), response.get("input_tokens", 0)
+            )
+            usage_out["output"] = _usage_add(
+                usage_out.get("output", 0), response.get("output_tokens", 0)
+            )
+            for source, target in (
+                ("cache_read_tokens", "cache_read_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
+                ("reasoning_tokens", "reasoning_tokens"),
+                ("copilot_usage_cost", "copilot_usage_cost"),
+            ):
+                usage_out[target] = _usage_add(
+                    usage_out.get(target, 0), response.get(source, 0)
+                )
+            for key in (
+                "context_current_tokens",
+                "context_limit",
+                "model",
+                "finish_reason",
+            ):
+                if response.get(key) not in (None, ""):
+                    usage_out[key] = response[key]
+        return str(response.get("content") or "")
 
     if backend == "bedrock":
         try:
